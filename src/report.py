@@ -1,0 +1,159 @@
+"""Per-card report generator: model probability vs. market vs. edge.
+
+Takes a list of upcoming matchups (fighter ID pairs) that do NOT need to
+exist in the fights table -- an upcoming card, by definition, hasn't
+happened yet, so this goes through features.matchup_feature_dict directly
+rather than the fights-table-backed feature matrix used for training. Both
+paths share the exact same feature computation, so a report can never
+silently diverge from how the model was trained.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+from datetime import date
+from pathlib import Path
+
+import joblib
+import pandas as pd
+
+from src import features, market, model
+
+DB_PATH = Path(__file__).resolve().parent.parent / "db" / "ufc.db"
+MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
+
+
+def load_latest_model(name: str = "logistic", models_dir: Path = MODELS_DIR):
+    """Loads the most recently saved artifact matching `name` (versioned
+    filenames sort chronologically by their timestamp suffix) -- a report
+    always uses the newest trained model rather than needing an exact
+    path typed in each time.
+    """
+    candidates = sorted(models_dir.glob(f"{name}_*.joblib"))
+    if not candidates:
+        raise FileNotFoundError(f"No saved model artifacts matching '{name}_*.joblib' in {models_dir}")
+    return joblib.load(candidates[-1]), candidates[-1]
+
+
+def load_calibration_table(model_path: Path) -> list[dict] | None:
+    """Reads the calibration table saved alongside a model artifact (see
+    model.py's save_model_artifact) from its sibling .json metadata file.
+    Returns None if the metadata file, or the calibration_table key in it,
+    is missing -- e.g. an older artifact saved before this was tracked.
+    """
+    meta_path = model_path.with_suffix(".json")
+    if not meta_path.exists():
+        return None
+    metrics = json.loads(meta_path.read_text()).get("metrics", {})
+    return metrics.get("calibration_table")
+
+
+def fighter_display_name(conn: sqlite3.Connection, fighter_id: str) -> str:
+    row = conn.execute("SELECT name FROM fighters WHERE fighter_id = ?", (fighter_id,)).fetchone()
+    return row[0] if row else fighter_id
+
+
+def _confidence_label(
+    f1_n_prior: int, f2_n_prior: int, model_prob: float | None = None, calibration_table: list[dict] | None = None
+) -> str:
+    """Combines two independent signals, not just one heuristic: (1) does
+    this specific matchup have real fight history to compute features from
+    (if either side has zero tracked prior fights, most of the feature
+    vector is null/imputed -- see the Phase 3 finding on sparse rolling
+    features, no amount of calibration evidence rescues that), and (2) has
+    this predicted probability actually been validated on enough held-out
+    examples in the saved model's own calibration table (model.py's
+    calibration_table, persisted via save_model_artifact) -- a probability
+    near 0.5 backed by 1,800 held-out fights is a very different claim than
+    the same number backed by 3.
+
+    Falls back to a feature-completeness-only signal when no calibration
+    table is available (e.g. an older model artifact) -- documented as
+    weaker, not treated as equally rigorous.
+    """
+    if min(f1_n_prior, f2_n_prior) == 0:
+        return "low"
+    if model_prob is None or not calibration_table:
+        return "medium" if min(f1_n_prior, f2_n_prior) < 3 else "high"
+
+    bucket_n = next(
+        (b["n"] for b in calibration_table if b["bin_low"] <= model_prob <= b["bin_high"]),
+        0,
+    )
+    if bucket_n >= 100:
+        return "high"
+    if bucket_n >= 20:
+        return "medium"
+    return "low"
+
+
+def build_card_report(
+    conn: sqlite3.Connection,
+    fitted_model,
+    matchups: list[tuple[str, str]],
+    as_of_date: str,
+    odds_type: str = "live",
+    n: int = 5,
+    calibration_table: list[dict] | None = None,
+) -> pd.DataFrame:
+    """One row per matchup: model probability, de-vigged market probability
+    (if odds are available for it), edge, and a confidence label.
+    """
+    rows = []
+    for fighter_1_id, fighter_2_id in matchups:
+        feat = features.matchup_feature_dict(conn, fighter_1_id, fighter_2_id, as_of_date, n=n)
+        X = pd.DataFrame([feat])[model.FEATURE_COLUMNS].astype(float)
+        model_prob = float(fitted_model.predict_proba(X)[0, 1])
+
+        market_probs = market.market_probabilities_for_matchup(conn, fighter_1_id, fighter_2_id, odds_type=odds_type)
+        market_prob = market_probs.get(fighter_1_id)
+        edge = market.compute_edge(model_prob, market_prob) if market_prob is not None else None
+
+        rows.append(
+            {
+                "fighter_1": fighter_display_name(conn, fighter_1_id),
+                "fighter_2": fighter_display_name(conn, fighter_2_id),
+                "model_prob_fighter_1": model_prob,
+                "market_prob_fighter_1": market_prob,
+                "edge_fighter_1": edge,
+                "confidence": _confidence_label(
+                    feat["f1_n_prior_fights"], feat["f2_n_prior_fights"], model_prob, calibration_table
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Per-card model-vs-market report")
+    parser.add_argument("--db", type=Path, default=DB_PATH)
+    parser.add_argument("--model", default="logistic")
+    parser.add_argument("--odds-type", default="live", choices=["open", "close", "live"])
+    parser.add_argument("--as-of-date", default=None, help="ISO date; defaults to today")
+    parser.add_argument(
+        "--matchup",
+        action="append",
+        required=True,
+        metavar="FIGHTER1_ID:FIGHTER2_ID",
+        help="Repeatable, one per fight on the card, e.g. --matchup abc123:def456",
+    )
+    args = parser.parse_args()
+
+    as_of_date = args.as_of_date or date.today().isoformat()
+    matchups = [tuple(m.split(":", 1)) for m in args.matchup]
+
+    conn = sqlite3.connect(args.db)
+    conn.row_factory = sqlite3.Row
+    fitted_model, model_path = load_latest_model(args.model)
+    calibration_table = load_calibration_table(model_path)
+    print(f"report.py: using model {model_path.name}, as of {as_of_date}")
+
+    report = build_card_report(
+        conn, fitted_model, matchups, as_of_date, odds_type=args.odds_type, calibration_table=calibration_table
+    )
+    print(report.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()

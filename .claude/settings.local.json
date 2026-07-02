@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -s -m 10 https://ufcstats.com/robots.txt)",
+      "Bash(curl -s -m 10 https://www.bestfightodds.com/robots.txt)",
+      "Bash(curl -s -m 10 -o /dev/null -w \"%{http_code}\\\\n\" https://ufcstats.com/statistics/events/completed)",
+      "WebFetch(domain:ufcstats.com)",
+      "Bash(curl -sv -m 10 https://ufcstats.com/)"
+    ]
+  }
+}
