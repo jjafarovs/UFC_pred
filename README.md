@@ -331,6 +331,35 @@ on *both* sides of "model vs. market" — what's left is a genuine research
 question (better features? a different model? a narrower, more selective
 edge threshold?), not a data-availability excuse.
 
+**Follow-up: edge-threshold sweep + bootstrap significance test.** Since
+"maybe a stricter edge threshold does better" is an obvious next question,
+swept `--edge-threshold` from 0.02 to 0.30 for both logistic and GBM.
+Raw ROI *looked* like it improved at stricter thresholds — GBM in
+particular went from −12.9% ROI (740 bets, threshold 0.02) to +28.9% ROI
+(75 bets, threshold 0.30), which would be an exciting result if taken at
+face value. **It doesn't survive scrutiny.** Bootstrap resampling (5,000
+resamples of each bucket's per-bet returns) puts a 95% confidence interval
+around every single tested threshold/model combination, and **every one of
+those intervals includes zero** — even the best case (GBM, threshold 0.30)
+is `[-13.4%, +74.7%]`. The apparent "improving trend" at stricter
+thresholds is consistent with shrinking sample size increasing variance in
+both directions, not with a real signal that gets purer as you filter
+harder; a genuine edge would be expected to hold a positive lower CI bound
+at least somewhere in the sweep, and none did.
+
+**One pattern is real and worth acting on, though**: across every
+threshold and both models, **80-90% of edge-flagged bets are on
+underdogs** (decimal odds ≥ 2.0) — 84.1% at the default threshold
+specifically. That's not noise; it's a consistent, systematic property of
+the model's output. It means the model's probability estimates specifically
+in the lower-probability (underdog) range are running more optimistic than
+the market's de-vigged consensus, across thousands of walk-forward
+predictions. This is a concrete, actionable lead for future feature/model
+work — e.g. checking calibration quality split by favorite vs. underdog
+separately (the aggregate calibration table hides this asymmetry), rather
+than a reason to expect the next feature added will just fix things
+generally.
+
 ## Reporting
 
 `src/report.py` takes a list of upcoming matchups (fighter ID pairs) and

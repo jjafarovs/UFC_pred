@@ -245,6 +245,42 @@ def backtest_summary(bets: pd.DataFrame, starting_bankroll: float) -> dict:
     }
 
 
+def bootstrap_roi_ci(bets: pd.DataFrame, n_boot: int = 5000, seed: int = 0) -> dict:
+    """95% bootstrap confidence interval on ROI, by resampling per-bet
+    (stake, payout) pairs with replacement. A point-estimate ROI on a few
+    hundred bets can look dramatic in either direction purely from variance
+    -- this is what actually distinguishes "real edge" from "noise that
+    looks like edge until you check." If the interval includes 0, the ROI
+    is not distinguishable from no edge at all at this sample size.
+
+    Concrete case this caught in practice (see README, Walk-forward
+    backtest): an edge-threshold sweep showed GBM's ROI apparently climbing
+    to +28.9% at a stricter threshold (75 bets) -- looked like a real
+    signal getting purer under a harder filter. This function's 95% CI for
+    that exact bucket is [-13.4%, +74.7%]: consistent with pure noise, not
+    evidence of skill. Every threshold/model combination tested had the
+    same problem -- none excluded zero.
+
+    Seeded by default (unlike this project's usual "don't fake determinism"
+    stance elsewhere) specifically so a reported CI is reproducible on
+    rerun, matching the project's model-artifact-versioning philosophy: a
+    backtest number should always be exactly reproducible, not "roughly
+    the same if you run it again."
+    """
+    if bets.empty:
+        return {"n": 0, "roi_low": None, "roi_median": None, "roi_high": None}
+    stakes = bets["stake"].to_numpy()
+    payouts = bets["payout"].to_numpy()
+    n = len(bets)
+    rng = np.random.default_rng(seed)
+    rois = np.empty(n_boot)
+    for i in range(n_boot):
+        idx = rng.integers(0, n, n)
+        rois[i] = payouts[idx].sum() / stakes[idx].sum()
+    lo, mid, hi = np.percentile(rois, [2.5, 50, 97.5])
+    return {"n": n, "roi_low": float(lo), "roi_median": float(mid), "roi_high": float(hi)}
+
+
 def plot_equity_curve(bets: pd.DataFrame, starting_bankroll: float, out_path: Path, title: str) -> None:
     import matplotlib
 
@@ -305,6 +341,13 @@ def main() -> None:
     print("backtest summary:", summary)
 
     if not bets.empty:
+        ci = bootstrap_roi_ci(bets)
+        print(
+            f"bootstrap 95% ROI CI: [{ci['roi_low']:+.3f}, {ci['roi_high']:+.3f}] "
+            f"(median {ci['roi_median']:+.3f}, n={ci['n']}) -- "
+            f"{'excludes zero: real signal' if ci['roi_low'] > 0 or ci['roi_high'] < 0 else 'includes zero: not distinguishable from noise'}"
+        )
+
         plot_path = BACKTESTS_DIR / f"equity_curve_{args.model}_{args.strategy}.png"
         plot_equity_curve(bets, args.starting_bankroll, plot_path, title=f"{args.model} / {args.strategy}")
         print(f"backtest.py: wrote equity curve -> {plot_path}")

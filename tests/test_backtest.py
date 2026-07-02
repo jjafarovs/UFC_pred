@@ -183,3 +183,36 @@ def test_backtest_summary_roi_and_max_drawdown_on_controlled_sequence():
 def test_backtest_summary_handles_no_bets():
     summary = backtest.backtest_summary(pd.DataFrame(), starting_bankroll=100.0)
     assert summary == {"n_bets": 0}
+
+
+def test_bootstrap_roi_ci_excludes_zero_for_consistent_positive_returns():
+    # Every bet returns exactly +20% -- zero variance, so any reasonable CI
+    # must sit tightly around +0.2 and clearly exclude zero.
+    bets = pd.DataFrame({"stake": [1.0] * 200, "payout": [0.2] * 200})
+    ci = backtest.bootstrap_roi_ci(bets, n_boot=1000)
+    assert ci["roi_low"] > 0
+    assert ci["roi_median"] == pytest.approx(0.2, abs=1e-6)
+
+
+def test_bootstrap_roi_ci_includes_zero_for_small_noisy_sample():
+    # Small, high-variance sample with a roughly-zero average -- consistent with noise.
+    bets = pd.DataFrame(
+        {
+            "stake": [1.0] * 10,
+            "payout": [5.0, -1.0, -1.0, 5.0, -1.0, -1.0, -1.0, -1.0, -1.0, -1.0],
+        }
+    )
+    ci = backtest.bootstrap_roi_ci(bets, n_boot=2000)
+    assert ci["roi_low"] < 0 < ci["roi_high"]
+
+
+def test_bootstrap_roi_ci_is_deterministic_with_a_fixed_seed():
+    bets = pd.DataFrame({"stake": [1.0, 2.0, 1.5], "payout": [0.5, -2.0, 1.0]})
+    ci_a = backtest.bootstrap_roi_ci(bets, n_boot=500, seed=7)
+    ci_b = backtest.bootstrap_roi_ci(bets, n_boot=500, seed=7)
+    assert ci_a == ci_b
+
+
+def test_bootstrap_roi_ci_handles_no_bets():
+    ci = backtest.bootstrap_roi_ci(pd.DataFrame())
+    assert ci == {"n": 0, "roi_low": None, "roi_median": None, "roi_high": None}
