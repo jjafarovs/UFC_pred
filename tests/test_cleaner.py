@@ -170,3 +170,46 @@ def test_fight_stats_written_for_totals_and_rounds(populated_db):
     total_f1 = next(r for r in rows if r["fighter_id"] == "f1" and r["round"] == 0)
     assert total_f1["sig_str_landed"] == 25
     assert total_f1["control_time_sec"] == 42
+
+
+def test_upsert_upcoming_card_writes_scheduled_fight(populated_db):
+    events = [{"event_id": "e_up", "name": "UFC Upcoming", "event_date_raw": "August 01, 2026", "location": "Las Vegas"}]
+    fights = [
+        {
+            "fight_id": "fight_upcoming",
+            "event_id": "e_up",
+            "fighter_1_id": "f1",
+            "fighter_2_id": "f2",
+            "weight_class": "Lightweight",
+            "title_fight": False,
+            "result": "scheduled",
+        }
+    ]
+    n = cleaner.upsert_upcoming_card(populated_db, events, fights)
+    assert n == 1
+    row = populated_db.execute("SELECT * FROM upcoming_fights WHERE fight_id='fight_upcoming'").fetchone()
+    assert row["event_date"] == "2026-08-01"
+    assert row["fighter_1_id"] == "f1"
+    assert row["weight_class"] == "Lightweight"
+
+
+def test_upsert_upcoming_card_replaces_wholesale_on_rerun(populated_db):
+    events = [{"event_id": "e_up", "name": "UFC Upcoming", "event_date_raw": "August 01, 2026", "location": "Las Vegas"}]
+    fight_a = [{"fight_id": "fight_a", "event_id": "e_up", "fighter_1_id": "f1", "fighter_2_id": "f2",
+                "weight_class": "Lightweight", "title_fight": False, "result": "scheduled"}]
+    fight_b = [{"fight_id": "fight_b", "event_id": "e_up", "fighter_1_id": "f1", "fighter_2_id": "f2",
+                "weight_class": "Welterweight", "title_fight": False, "result": "scheduled"}]
+
+    cleaner.upsert_upcoming_card(populated_db, events, fight_a)
+    cleaner.upsert_upcoming_card(populated_db, events, fight_b)  # card changed -- fight_a pulled, fight_b added
+
+    rows = populated_db.execute("SELECT fight_id FROM upcoming_fights").fetchall()
+    assert {r["fight_id"] for r in rows} == {"fight_b"}  # fight_a must be gone, not accumulated
+
+
+def test_upsert_upcoming_card_skips_unparseable_dates(populated_db):
+    events = [{"event_id": "e_bad", "name": "Bad Date Event", "event_date_raw": "Not A Date", "location": "Nowhere"}]
+    fights = [{"fight_id": "fight_bad", "event_id": "e_bad", "fighter_1_id": "f1", "fighter_2_id": "f2",
+               "weight_class": "Lightweight", "title_fight": False, "result": "scheduled"}]
+    n = cleaner.upsert_upcoming_card(populated_db, events, fights)
+    assert n == 0

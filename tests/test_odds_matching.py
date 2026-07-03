@@ -166,3 +166,105 @@ def test_match_and_store_odds_is_idempotent_on_rerun(populated_db):
     cleaner.match_and_store_odds(populated_db, bfo_events)
     cleaner.match_and_store_odds(populated_db, bfo_events)  # re-running with the same data must not duplicate rows
     assert populated_db.execute("SELECT COUNT(*) FROM odds").fetchone()[0] == 2
+
+
+def _add_upcoming_fight(conn, fight_id="fight_up", event_date="2026-08-01", f1="f1", f2="f2"):
+    conn.execute(
+        "INSERT INTO upcoming_fights (fight_id, event_id, event_name, event_date, weight_class, "
+        "title_fight, fighter_1_id, fighter_2_id, scraped_at) "
+        "VALUES (?, 'e_up', 'UFC Upcoming', ?, 'Lightweight', 0, ?, ?, 'now')",
+        (fight_id, event_date, f1, f2),
+    )
+    conn.commit()
+
+
+def test_match_and_store_live_odds_links_to_upcoming_fighters(populated_db):
+    _add_upcoming_fight(populated_db)
+    bfo_events = [
+        {
+            "event_name": "UFC Upcoming",
+            "event_date_raw": "August 01, 2026",
+            "matchups": [
+                {
+                    "matchup_id": "111",
+                    "fighters": [
+                        {"fighter_name": "Fighter One", "odds": {"FanDuel": -150}},
+                        {"fighter_name": "Fighter Two", "odds": {"FanDuel": 130}},
+                    ],
+                }
+            ],
+        }
+    ]
+    n = cleaner.match_and_store_live_odds(populated_db, bfo_events)
+    assert n == 1
+    rows = populated_db.execute("SELECT * FROM odds WHERE odds_type='live'").fetchall()
+    assert len(rows) == 2
+    assert all(r["fight_id"] is None for r in rows)  # deliberately NULL -- see docstring
+    f1_row = next(r for r in rows if r["fighter_name_raw"] == "Fighter One")
+    assert f1_row["fighter_id"] == "f1"
+
+
+def test_match_and_store_live_odds_does_not_clobber_close_odds(populated_db):
+    cleaner.match_and_store_odds(
+        populated_db,
+        [
+            {
+                "event_name": "UFC Fixture Night",
+                "event_date_raw": "June 27, 2026",
+                "matchups": [
+                    {
+                        "matchup_id": "999",
+                        "fighters": [
+                            {"fighter_name": "Fighter One", "odds": {"FanDuel": -150}},
+                            {"fighter_name": "Fighter Two", "odds": {"FanDuel": 130}},
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+    _add_upcoming_fight(populated_db)
+    cleaner.match_and_store_live_odds(
+        populated_db,
+        [
+            {
+                "event_name": "UFC Upcoming",
+                "event_date_raw": "August 01, 2026",
+                "matchups": [
+                    {
+                        "matchup_id": "111",
+                        "fighters": [
+                            {"fighter_name": "Fighter One", "odds": {"FanDuel": -200}},
+                            {"fighter_name": "Fighter Two", "odds": {"FanDuel": 170}},
+                        ],
+                    }
+                ],
+            }
+        ],
+    )
+    close_rows = populated_db.execute("SELECT * FROM odds WHERE odds_type='close'").fetchall()
+    live_rows = populated_db.execute("SELECT * FROM odds WHERE odds_type='live'").fetchall()
+    assert len(close_rows) == 2  # untouched by the live-odds call
+    assert len(live_rows) == 2
+
+
+def test_match_and_store_live_odds_is_idempotent_on_rerun(populated_db):
+    _add_upcoming_fight(populated_db)
+    bfo_events = [
+        {
+            "event_name": "UFC Upcoming",
+            "event_date_raw": "August 01, 2026",
+            "matchups": [
+                {
+                    "matchup_id": "111",
+                    "fighters": [
+                        {"fighter_name": "Fighter One", "odds": {"FanDuel": -150}},
+                        {"fighter_name": "Fighter Two", "odds": {"FanDuel": 130}},
+                    ],
+                }
+            ],
+        }
+    ]
+    cleaner.match_and_store_live_odds(populated_db, bfo_events)
+    cleaner.match_and_store_live_odds(populated_db, bfo_events)
+    assert populated_db.execute("SELECT COUNT(*) FROM odds WHERE odds_type='live'").fetchone()[0] == 2

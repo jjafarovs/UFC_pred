@@ -123,6 +123,59 @@ def test_load_latest_model_raises_when_none_found(tmp_path):
         report.load_latest_model("logistic", models_dir=tmp_path)
 
 
+def test_load_production_model_falls_back_to_latest_without_a_pin(tmp_path, monkeypatch):
+    import joblib
+
+    # Must not depend on whatever the real project's models/production.json says --
+    # point PRODUCTION_CONFIG_PATH at a tmp location that deliberately has no pin file.
+    monkeypatch.setattr(report, "PRODUCTION_CONFIG_PATH", tmp_path / "production.json")
+    joblib.dump(_FakeModel(0.5), tmp_path / "logistic_20260101T000000Z.joblib")
+    joblib.dump(_FakeModel(0.6), tmp_path / "logistic_20260601T120000Z.joblib")
+
+    loaded, path = report.load_production_model("logistic", models_dir=tmp_path)
+    assert path.name == "logistic_20260601T120000Z.joblib"
+    assert loaded.prob == 0.6
+
+
+def test_set_and_load_production_model_pin(tmp_path):
+    import joblib
+
+    old_path = tmp_path / "logistic_20260101T000000Z.joblib"
+    new_path = tmp_path / "logistic_20260601T120000Z.joblib"
+    joblib.dump(_FakeModel(0.5), old_path)
+    joblib.dump(_FakeModel(0.6), new_path)
+    config_path = tmp_path / "production.json"
+
+    # Deliberately pin the OLDER artifact -- proves the pin overrides "latest by filename".
+    report.set_production_model("logistic", old_path, config_path=config_path)
+    # load_production_model uses the module-level PRODUCTION_CONFIG_PATH by default,
+    # so patch it to point at our tmp config for this test.
+    import src.report as report_module
+
+    original = report_module.PRODUCTION_CONFIG_PATH
+    report_module.PRODUCTION_CONFIG_PATH = config_path
+    try:
+        loaded, path = report.load_production_model("logistic", models_dir=tmp_path)
+    finally:
+        report_module.PRODUCTION_CONFIG_PATH = original
+    assert path.name == "logistic_20260101T000000Z.joblib"
+    assert loaded.prob == 0.5
+
+
+def test_load_production_model_raises_if_pinned_file_missing(tmp_path):
+    import src.report as report_module
+
+    config_path = tmp_path / "production.json"
+    config_path.write_text('{"logistic": "does_not_exist.joblib"}')
+    original = report_module.PRODUCTION_CONFIG_PATH
+    report_module.PRODUCTION_CONFIG_PATH = config_path
+    try:
+        with pytest.raises(FileNotFoundError):
+            report.load_production_model("logistic", models_dir=tmp_path)
+    finally:
+        report_module.PRODUCTION_CONFIG_PATH = original
+
+
 def test_load_calibration_table_reads_from_sibling_metadata(tmp_path):
     import joblib
 

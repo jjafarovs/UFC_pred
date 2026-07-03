@@ -46,6 +46,29 @@ CREATE INDEX IF NOT EXISTS idx_fights_event_date ON fights(event_date);
 CREATE INDEX IF NOT EXISTS idx_fights_fighter1 ON fights(fighter_1_id);
 CREATE INDEX IF NOT EXISTS idx_fights_fighter2 ON fights(fighter_2_id);
 
+-- Deliberately a SEPARATE table from `fights`, not a nullable-result row in
+-- it: fights_before()/build_feature_matrix() only ever query `fights`, and
+-- keeping scheduled (not-yet-happened) bouts out of that table entirely
+-- means there is no query path by which an upcoming fight could be treated
+-- as historical training data, structurally, not just by convention. This
+-- is a snapshot of "what's currently scheduled" -- cleaner.py replaces its
+-- contents wholesale on each refresh rather than appending, since cards
+-- change (fighters pulled/swapped) rather than growing monotonically like
+-- completed history does.
+CREATE TABLE IF NOT EXISTS upcoming_fights (
+    fight_id        TEXT PRIMARY KEY,
+    event_id        TEXT NOT NULL,
+    event_name      TEXT,
+    event_date      TEXT NOT NULL,
+    location        TEXT,
+    weight_class    TEXT,
+    title_fight     INTEGER NOT NULL DEFAULT 0,
+    fighter_1_id    TEXT NOT NULL REFERENCES fighters(fighter_id),
+    fighter_2_id    TEXT NOT NULL REFERENCES fighters(fighter_id),
+    source_url      TEXT,
+    scraped_at      TEXT NOT NULL
+);
+
 -- One row per (fight, fighter, round). round = 0 means fight-total row.
 CREATE TABLE IF NOT EXISTS fight_stats (
     fight_id                TEXT NOT NULL REFERENCES fights(fight_id),

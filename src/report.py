@@ -24,16 +24,50 @@ DB_PATH = Path(__file__).resolve().parent.parent / "db" / "ufc.db"
 MODELS_DIR = Path(__file__).resolve().parent.parent / "models"
 
 
+PRODUCTION_CONFIG_PATH = MODELS_DIR / "production.json"
+
+
 def load_latest_model(name: str = "logistic", models_dir: Path = MODELS_DIR):
     """Loads the most recently saved artifact matching `name` (versioned
-    filenames sort chronologically by their timestamp suffix) -- a report
-    always uses the newest trained model rather than needing an exact
-    path typed in each time.
+    filenames sort chronologically by their timestamp suffix). Useful for
+    ad hoc CLI use right after retraining; anything meant to run
+    unattended (the dashboard, refresh.py) should use load_production_model
+    instead -- "whatever's newest" is fine for a one-off check, but not for
+    something that keeps running across retrains you haven't reviewed yet.
     """
     candidates = sorted(models_dir.glob(f"{name}_*.joblib"))
     if not candidates:
         raise FileNotFoundError(f"No saved model artifacts matching '{name}_*.joblib' in {models_dir}")
     return joblib.load(candidates[-1]), candidates[-1]
+
+
+def load_production_model(name: str = "logistic", models_dir: Path = MODELS_DIR):
+    """Loads the model artifact deliberately pinned as "production" in
+    models/production.json (e.g. {"logistic": "logistic_20260702T202618Z.joblib"}),
+    falling back to load_latest_model if no pin exists for `name` -- so this
+    works out of the box before anyone's created a pin, but a real deployment
+    (the dashboard) is never silently using a model nobody reviewed just
+    because it happened to be retrained most recently.
+    """
+    if PRODUCTION_CONFIG_PATH.exists():
+        pins = json.loads(PRODUCTION_CONFIG_PATH.read_text())
+        pinned_filename = pins.get(name)
+        if pinned_filename:
+            path = models_dir / pinned_filename
+            if not path.exists():
+                raise FileNotFoundError(f"production.json pins '{name}' to {path}, which doesn't exist")
+            return joblib.load(path), path
+    return load_latest_model(name, models_dir)
+
+
+def set_production_model(name: str, model_path: Path, config_path: Path = PRODUCTION_CONFIG_PATH) -> None:
+    """Pins `name` (e.g. 'logistic') to a specific artifact filename in
+    models/production.json. The dashboard/refresh.py should be pointed at a
+    deliberately reviewed model, not whatever a retrain most recently produced.
+    """
+    pins = json.loads(config_path.read_text()) if config_path.exists() else {}
+    pins[name] = model_path.name
+    config_path.write_text(json.dumps(pins, indent=2))
 
 
 def load_calibration_table(model_path: Path) -> list[dict] | None:

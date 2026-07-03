@@ -109,19 +109,17 @@ def _clean_text(node) -> str:
     return node.get_text(strip=True) if node else ""
 
 
-def list_completed_events(client: UFCStatsClient) -> list[dict]:
-    """Return every completed event: {event_id, name, event_date, location}.
-
-    Uses ?page=all so this is a single request rather than ~30 paginated ones.
-    The very first row on this listing is sometimes the next *upcoming* event
-    (marked with a "next" icon) rather than a completed one — callers should
-    still treat event_date as authoritative and let downstream fight-level
-    completeness checks (see parse_event) be the real filter.
+def _list_events(client: UFCStatsClient, path: str) -> list[dict]:
+    """Shared row-parsing for both the completed and upcoming events listing
+    pages -- identical markup (same table/row/link classes) on both, just a
+    different path and time direction. Uses ?page=all so this is a single
+    request rather than ~30 paginated ones for the completed listing (the
+    upcoming listing is short enough that this is moot but harmless).
     """
-    html = client.get("/statistics/events/completed", params={"page": "all"})
+    html = client.get(path, params={"page": "all"})
     soup = BeautifulSoup(html, "lxml")
     events = []
-    # NOTE: the first row on this page uses a different row class
+    # NOTE: the first row on this page sometimes uses a different row class
     # ("b-statistics__table-row_type_first") than the rest -- select on the
     # table body's <tr> generally and rely on the link/date presence check
     # below to skip the blank spacer row, rather than matching on row class.
@@ -142,6 +140,27 @@ def list_completed_events(client: UFCStatsClient) -> list[dict]:
             }
         )
     return events
+
+
+def list_completed_events(client: UFCStatsClient) -> list[dict]:
+    """Return every completed event: {event_id, name, event_date, location}.
+
+    The very first row on this listing is sometimes the next *upcoming*
+    event (marked with a "next" icon) rather than a completed one — callers
+    should still treat event_date as authoritative and let downstream
+    fight-level completeness checks (see parse_event) be the real filter.
+    """
+    return _list_events(client, "/statistics/events/completed")
+
+
+def list_upcoming_events(client: UFCStatsClient) -> list[dict]:
+    """Return every scheduled-but-not-yet-fought event: {event_id, name,
+    event_date, location}. Same markup as list_completed_events, different
+    listing page. Every fight_id on these events will come back from
+    parse_fight with result='scheduled' -- see fetch_upcoming_card, which is
+    the actual entry point for pulling a fight card before it happens.
+    """
+    return _list_events(client, "/statistics/events/upcoming")
 
 
 def parse_event(client: UFCStatsClient, event_id: str) -> dict:
@@ -204,6 +223,10 @@ def parse_fight(client: UFCStatsClient, fight_id: str) -> dict:
     Returns result='scheduled' for fights that haven't happened yet (no W/L
     flag present) — cleaner.py must skip those rather than writing a fake
     result, since a scheduled fight has no outcome to train or backtest on.
+    A scheduled fight still carries fighter_1_id/fighter_2_id/weight_class,
+    though -- that's exactly the information an upcoming-card discovery
+    pass needs (see fetch_upcoming_card), and there's no reason to throw it
+    away just because there's no result to report alongside it yet.
     """
     html = client.get(f"/fight-details/{fight_id}")
     soup = BeautifulSoup(html, "lxml")
@@ -219,6 +242,10 @@ def parse_fight(client: UFCStatsClient, fight_id: str) -> dict:
         fighter_ids.append(link["href"].rstrip("/").rsplit("/", 1)[-1] if link else None)
         statuses.append(_clean_text(person.select_one("i.b-fight-details__person-status")))
 
+    fight_title_raw = _clean_text(soup.select_one("i.b-fight-details__fight-title"))
+    title_fight = "title" in fight_title_raw.lower()
+    weight_class = re.sub(r"\s*(Title\s*)?Bout$", "", fight_title_raw, flags=re.I).strip()
+
     if statuses[0] == "W" and statuses[1] == "L":
         result, winner_id = "fighter_1", fighter_ids[0]
     elif statuses[0] == "L" and statuses[1] == "W":
@@ -229,11 +256,15 @@ def parse_fight(client: UFCStatsClient, fight_id: str) -> dict:
         result, winner_id = "nc", None
     else:
         # No decided result yet -> fight hasn't happened (scheduled/upcoming).
-        return {"fight_id": fight_id, "result": "scheduled"}
-
-    fight_title_raw = _clean_text(soup.select_one("i.b-fight-details__fight-title"))
-    title_fight = "title" in fight_title_raw.lower()
-    weight_class = re.sub(r"\s*(Title\s*)?Bout$", "", fight_title_raw, flags=re.I).strip()
+        return {
+            "fight_id": fight_id,
+            "result": "scheduled",
+            "fighter_1_id": fighter_ids[0],
+            "fighter_2_id": fighter_ids[1],
+            "weight_class": weight_class,
+            "title_fight": title_fight,
+            "source_url": f"{BASE_URL}/fight-details/{fight_id}",
+        }
 
     labels = {}
     for item in soup.select("i.b-fight-details__text-item, i.b-fight-details__text-item_first"):
@@ -658,6 +689,66 @@ def _load_existing(name: str) -> list:
     return json.loads(path.read_text()) if path.exists() else []
 
 
+def fetch_upcoming_card(client: UFCStatsClient, max_events: int | None = None) -> dict:
+    """One-shot pull of every currently scheduled (not-yet-fought) event and
+    its fight card: fighter pairs, weight class, date.
+
+    Returns a snapshot, not something to merge incrementally with a prior
+    one the way bootstrap() does for completed history -- upcoming cards
+    change shape (fighters get pulled/swapped, fights added), so the
+    caller (cleaner.py) is expected to replace its stored upcoming_fights
+    table wholesale on each refresh rather than append to it.
+
+    Also collects the set of fighter_ids appearing on these cards so the
+    caller can fetch bios for any genuinely new fighters (a promotional
+    newcomer with no prior UFC fight) -- reuses parse_fighter, same as the
+    historical bootstrap.
+    """
+    events = list_upcoming_events(client)
+    if max_events is not None:
+        events = events[:max_events]
+
+    full_events, scheduled_fights, fighter_ids = [], [], set()
+    for ev in events:
+        detail = parse_event(client, ev["event_id"])
+        detail.update({k: v for k, v in ev.items() if k not in detail or not detail[k]})
+        full_events.append(detail)
+        for fight_id in detail["fight_ids"]:
+            fight = parse_fight(client, fight_id)
+            if fight.get("result") != "scheduled":
+                continue  # already happened, or a malformed page -- not part of the upcoming snapshot
+            fight["event_id"] = ev["event_id"]
+            fight["event_name"] = detail.get("name")
+            fight["event_date_raw"] = detail.get("event_date_raw")
+            fight["location"] = detail.get("location")
+            scheduled_fights.append(fight)
+            fighter_ids.add(fight["fighter_1_id"])
+            fighter_ids.add(fight["fighter_2_id"])
+
+    return {"events": full_events, "fights": scheduled_fights, "fighter_ids": sorted(fighter_ids)}
+
+
+def _fetch_missing_fighters(client: UFCStatsClient, fighter_ids: set[str], checkpoint_every: int = 25) -> list[dict]:
+    """Loads data/raw/fighters.json, fetches bios for any of `fighter_ids`
+    not already present, and checkpoints to disk periodically. Shared by
+    bootstrap() (historical backfill) and the upcoming-card fetch path (a
+    promotional newcomer with no prior fight needs a bio too) so there is
+    one incremental/resumable fighter-fetch implementation, not two.
+    """
+    fighters = _load_existing("fighters")
+    fetched_fighter_ids = {f["fighter_id"] for f in fighters}
+    remaining_fighter_ids = sorted(fighter_ids - fetched_fighter_ids)
+    print(f"fetcher: {len(fetched_fighter_ids)} fighters already fetched, {len(remaining_fighter_ids)} remaining")
+
+    for i, fid in enumerate(remaining_fighter_ids, start=1):
+        fighters.append(parse_fighter(client, fid))
+        if i % checkpoint_every == 0 or i == len(remaining_fighter_ids):
+            dump_raw("fighters", fighters)
+            print(f"fetcher: checkpointed {i}/{len(remaining_fighter_ids)} new fighters ({len(fighters)} total)")
+
+    return fighters
+
+
 def bootstrap(
     max_events: int | None = None,
     with_odds: bool = False,
@@ -717,16 +808,7 @@ def bootstrap(
                 f"({len(full_events)} total events, {len(all_fights)} total fights)"
             )
 
-    fighters = _load_existing("fighters")
-    fetched_fighter_ids = {f["fighter_id"] for f in fighters}
-    remaining_fighter_ids = sorted(fighter_ids - fetched_fighter_ids)
-    print(f"fetcher: {len(fetched_fighter_ids)} fighters already fetched, {len(remaining_fighter_ids)} remaining")
-
-    for i, fid in enumerate(remaining_fighter_ids, start=1):
-        fighters.append(parse_fighter(client, fid))
-        if i % fighter_checkpoint_every == 0 or i == len(remaining_fighter_ids):
-            dump_raw("fighters", fighters)
-            print(f"fetcher: checkpointed {i}/{len(remaining_fighter_ids)} new fighters ({len(fighters)} total)")
+    fighters = _fetch_missing_fighters(client, fighter_ids, checkpoint_every=fighter_checkpoint_every)
 
     print(
         f"Fetched {len(full_events)} events, {len(all_fights)} completed fights, "
@@ -759,7 +841,39 @@ def main() -> None:
         default=40,
         help="How many recent bestfightodds.com events to fetch when --with-odds is set",
     )
+    parser.add_argument(
+        "--upcoming",
+        action="store_true",
+        help="Fetch the current upcoming-card snapshot instead of historical completed events",
+    )
+    parser.add_argument(
+        "--with-live-odds",
+        action="store_true",
+        help="With --upcoming, also fetch current bestfightodds.com lines for the card's fighters",
+    )
     args = parser.parse_args()
+
+    if args.upcoming:
+        client = UFCStatsClient()
+        card = fetch_upcoming_card(client, max_events=args.max_events)
+        dump_raw("upcoming_events", card["events"])
+        dump_raw("upcoming_fights", card["fights"])
+        fighters = _fetch_missing_fighters(client, set(card["fighter_ids"]))
+        print(
+            f"Fetched {len(card['events'])} upcoming events, {len(card['fights'])} scheduled fights, "
+            f"{len(fighters)} fighters total -> {RAW_DIR}"
+        )
+
+        if args.with_live_odds:
+            fighter_by_id = {f["fighter_id"]: f["name"] for f in fighters}
+            fighter_names = [fighter_by_id[fid] for fid in card["fighter_ids"] if fid in fighter_by_id]
+            since_date = datetime.now().date().isoformat()
+            odds_client = BestFightOddsClient()
+            live_events = fetch_bestfightodds_for_fighters(odds_client, fighter_names, since_date=since_date)
+            dump_raw("odds_bestfightodds_live", live_events)
+            print(f"Fetched live odds from {len(live_events)} bestfightodds events -> {RAW_DIR}")
+        return
+
     bootstrap(
         max_events=args.max_events,
         with_odds=args.with_odds,

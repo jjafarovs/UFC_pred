@@ -24,7 +24,8 @@ as-of-date helper all feature builders are required to go through, and
 | 3 | Model + calibration | **Done** — see below |
 | 4 | Market de-vigging + edge | **Done** — see below |
 | 5 | Walk-forward backtest | **Done** — see below |
-| 6 | Reporting / dashboard | **Done** (CLI report) — see below; Streamlit dashboard not built (optional per spec) |
+| 6 | Reporting / dashboard | **Done** — CLI report + a Streamlit dashboard (V1, informational, local-only) |
+| — | Live pipeline (upcoming cards, live odds, scheduled refresh) | **Done** — see below |
 
 ## Architecture
 
@@ -49,18 +50,20 @@ ufc-edge/
     market.py                # odds -> de-vigged probability, edge
     backtest.py                # walk-forward backtest engine, ROI/Kelly sizing, drawdown
     report.py                   # per-card model-vs-market report (upcoming matchups)
+    refresh.py                    # scheduled entry point: fetch -> clean -> features -> retrain
   tests/
     test_fetcher.py              # HTML parsing, against saved fixtures
-    test_cleaner.py                # JSON -> SQLite normalization
+    test_cleaner.py                # JSON -> SQLite normalization, upcoming-card storage
     test_bestfightodds.py           # odds page parsing
     test_bestfightodds_discovery.py   # fighter-profile-based historical odds lookup
-    test_odds_matching.py               # cross-source fighter/fight matching, timestamp verification
+    test_odds_matching.py               # cross-source fighter/fight matching, timestamp verification, live odds
     test_features.py                    # as-of-date feature engineering
     test_model.py                        # training/calibration/artifact roundtrip
     test_market.py                         # de-vig math, edge calc, per-fight consensus
     test_backtest.py                        # walk-forward retraining, bet sizing, ROI/drawdown
     test_report.py                            # upcoming-matchup report, model artifact loading
-    test_no_leakage.py                          # leakage sanity checks
+    test_refresh.py                            # scheduled-refresh call sequencing
+    test_no_leakage.py                           # leakage sanity checks
 ```
 
 `fetcher.py` only fetches and parses HTML into plain dicts, and writes raw
@@ -493,6 +496,102 @@ calibration table saved (`report.load_calibration_table` returns `None`).
 A Streamlit dashboard wrapping this report is a nice-to-have per the original spec, not
 built here.
 
+## Live pipeline: upcoming cards, live odds, scheduled refresh
+
+Everything above this section works on *historical* data. Three gaps had to
+be closed before any of it could serve a live, auto-updating dashboard:
+
+**1. Upcoming-card discovery** (`fetcher.list_upcoming_events`,
+`fetch_upcoming_card`) — ufcstats.com's `/statistics/events/upcoming` page
+turned out to share identical markup with the completed-events page, so
+this reuses the same row-parsing (`_list_events`) and the same
+`parse_event`/`parse_fight` functions used for history. The one real
+change needed: `parse_fight` used to discard fighter IDs for a scheduled
+(not-yet-fought) bout, returning only `{"result": "scheduled"}` — exactly
+the information an upcoming card needs was being thrown away. Fixed to
+include `fighter_1_id`/`fighter_2_id`/`weight_class` on that path too.
+
+Scheduled fights are stored in a **separate `upcoming_fights` table**, not
+mixed into `fights` — `fights_before()`/`build_feature_matrix()` only ever
+query `fights`, so this keeps it structurally impossible for a fight that
+hasn't happened yet to be treated as training history, rather than relying
+on convention. It's also a wholesale-replace table (`cleaner.upsert_upcoming_card`
+deletes and rewrites on every refresh), not an append-only log — a card's
+shape changes between refreshes (injuries, replacements), unlike completed
+history, which only ever grows.
+
+**2. Live odds ingestion** (`cleaner.match_and_store_live_odds`) — the
+schema and read path (`market.market_probabilities_for_matchup`, filtering
+`fight_id IS NULL AND odds_type='live'`) already existed from Phase 6, but
+nothing wrote those rows; `match_and_store_odds` only stores odds matched
+to an *already-completed* fight. The new function mirrors that matching
+logic (fighter-name + date), sourced from `upcoming_fights` instead of
+`fights`, always storing `fight_id=NULL` (a strict foreign key ties
+`odds.fight_id` to `fights`, and an upcoming bout isn't in that table by
+design — seed the fighter-pair lookup path, not the fight_id one). One
+real bug caught while building this: the existing idempotency guard on
+`match_and_store_odds` (`DELETE FROM odds WHERE source='bestfightodds'`)
+would have silently wiped every live-odds row on its next run, since both
+functions share the same table. Fixed by scoping each function's delete to
+its own `odds_type`.
+
+```bash
+python3 -m src.fetcher --upcoming --with-live-odds   # discover the card + fetch current lines
+python3 -m src.cleaner                                # normalize both into SQLite
+```
+
+Real run against the actual current UFC schedule: 7 upcoming events, 61
+scheduled fights, 15 matched with live odds so far (coverage grows as
+fight day approaches and more books post lines). `report.py` run against
+two of these — a real, live McGregor vs. Holloway 2 matchup — produces
+model probability 56.3% vs. de-vigged market 33.6%, edge +22.6%. That's a
+large gap, and per the Walk-forward backtest findings above, large gaps
+are exactly the case that's been shown to be a net-negative signal
+historically, not a promising one — worth remembering once this feeds a
+dashboard's "edge" column.
+
+**3. Scheduled/automatic refresh** (`src/refresh.py`) — a single entry
+point sequencing the already-tested CLIs (pure orchestration, no new
+fetch/clean logic), because the pieces have different natural cadences:
+
+```bash
+python3 -m src.refresh --mode upcoming   # card + live odds; cheap, safe to run hourly
+python3 -m src.refresh --mode full       # incremental history + odds + features + retrain; daily/weekly
+```
+
+Nothing currently triggers these on a schedule — that's a deployment
+decision (plain cron, or this harness's own scheduling) left for whenever
+the dashboard's hosting is decided, not assumed here.
+
+## Dashboard (V1, informational)
+
+`app.py` is a Streamlit app: pick an upcoming card, see every fight's model
+probability, de-vigged live market probability, the gap ("edge"), a
+confidence label, and (per fight) the underlying rolling-form/striking/
+takedown/physical stats behind the number. Local/personal use only, no
+hosting — everything reads straight from `db/ufc.db`.
+
+```bash
+streamlit run app.py
+```
+
+Deliberately **not** a betting tool: the disclaimer banner is load-bearing,
+not decoration. The Walk-forward backtest section above found, with
+statistical significance, that large disagreements between this model and
+the market have been a net loss historically — so the UI frames edge as
+"where the model and market disagree," never as a recommendation.
+
+Two things fixed specifically for this: (1) `report.load_production_model`
+— the dashboard pins a specific reviewed model artifact
+(`models/production.json`) instead of `load_latest_model`'s "whatever was
+trained most recently," since something running unattended shouldn't
+silently pick up an unreviewed retrain; (2) a real bug caught by actually
+driving the app in a browser rather than trusting that it imported cleanly
+— `pd.DataFrame(rows)` turns a missing value's Python `None` into `NaN`,
+and the display formatter's `x is None` check missed that, rendering a
+literal `"nan%"` in the UI for any fight without matched odds. Fixed to
+check `pd.isna(x)` instead.
+
 ## Setup
 
 ```bash
@@ -524,9 +623,12 @@ smoke-test sample, drop `--max-events` and expect a long run given the
 
 ## Schema
 
-See `db/schema.sql`. Five tables: `fighters`, `events`, `fights`,
-`fight_stats` (one row per fight/fighter/round, `round=0` = fight total), and
-`odds` (one row per fight/fighter/sportsbook/odds_type). `fights.event_date`
+See `db/schema.sql`. Six tables: `fighters`, `events`, `fights`,
+`fight_stats` (one row per fight/fighter/round, `round=0` = fight total),
+`odds` (one row per fight/fighter/sportsbook/odds_type), and
+`upcoming_fights` (a wholesale-replaced snapshot of the current card, kept
+structurally separate from `fights` so a not-yet-fought bout can never be
+queried as training history -- see Live pipeline). `fights.event_date`
 is denormalized from `events` specifically so every fight can be filtered by
 date without a join -- that's the field Phase 2's as-of-date logic depends
 on.

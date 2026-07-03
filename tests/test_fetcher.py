@@ -33,6 +33,15 @@ def test_list_completed_events_parses_rows():
     assert completed_sample["location"] == "Baku, Azerbaijan"
 
 
+def test_list_upcoming_events_parses_rows():
+    html = (FIXTURES / "events_upcoming_page.html").read_text()
+    events = fetcher.list_upcoming_events(FixtureClient(html))
+    assert len(events) > 3
+    first = events[0]
+    assert first["event_id"] == "fccb0fee256b7b4d"
+    assert "McGregor" in first["name"]
+
+
 def test_parse_event_extracts_metadata_and_fight_ids():
     html = (FIXTURES / "event_completed.html").read_text()
     event = fetcher.parse_event(FixtureClient(html), "31e1ea6fe6b682f8")
@@ -70,10 +79,16 @@ def test_parse_fight_completed_extracts_result_and_totals():
 
 
 def test_parse_fight_scheduled_is_not_treated_as_completed():
-    """A fight with no W/L flag yet must come back as 'scheduled', never a fake result."""
+    """A fight with no W/L flag yet must come back as 'scheduled', never a fake result,
+    but still carries fighter IDs/weight class -- that's exactly what upcoming-card
+    discovery needs, and there's no result to report alongside it that would leak.
+    """
     html = (FIXTURES / "fight_scheduled.html").read_text()
     fight = fetcher.parse_fight(FixtureClient(html), "989760fa75321d69")
     assert fight["result"] == "scheduled"
+    assert fight["fighter_1_id"] == "f4c49976c75c5ab2"
+    assert fight["fighter_2_id"] == "150ff4cc642270b9"
+    assert "weight_class" in fight
 
 
 def test_parse_fighter_extracts_bio_fields_only():
@@ -88,3 +103,42 @@ def test_parse_fighter_extracts_bio_fields_only():
     # Leakage guard: career-aggregate fields (SLpM, win streaks, etc.) must
     # never appear on the parsed object -- see the docstring in parse_fighter.
     assert "slpm" not in {k.lower() for k in fighter}
+
+
+class MultiFixtureClient:
+    """Routes by path prefix to a fixed HTML string -- for orchestration
+    functions (fetch_upcoming_card) that hit several distinct page types in
+    one call.
+    """
+
+    def __init__(self, responses: dict[str, str]):
+        self.responses = responses
+
+    def get(self, path, params=None):
+        for prefix, html in self.responses.items():
+            if path.startswith(prefix):
+                return html
+        raise AssertionError(f"MultiFixtureClient has no response configured for {path}")
+
+
+def test_fetch_upcoming_card_returns_scheduled_fights_and_fighter_ids():
+    events_html = (FIXTURES / "events_upcoming_page.html").read_text()
+    event_html = (FIXTURES / "event_upcoming.html").read_text()
+    fight_html = (FIXTURES / "fight_scheduled.html").read_text()
+
+    client = MultiFixtureClient(
+        {
+            "/statistics/events/upcoming": events_html,
+            "/event-details/fccb0fee256b7b4d": event_html,
+            "/fight-details/": fight_html,
+        }
+    )
+    card = fetcher.fetch_upcoming_card(client, max_events=1)
+
+    assert len(card["events"]) == 1
+    assert card["events"][0]["event_id"] == "fccb0fee256b7b4d"
+    assert len(card["fights"]) == 14  # every fight_id on that event's card
+    assert all(f["result"] == "scheduled" for f in card["fights"])
+    assert all(f["event_id"] == "fccb0fee256b7b4d" for f in card["fights"])
+    assert "f4c49976c75c5ab2" in card["fighter_ids"]  # McGregor
+    assert "150ff4cc642270b9" in card["fighter_ids"]  # Holloway

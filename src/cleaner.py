@@ -317,14 +317,18 @@ def match_and_store_odds(conn: sqlite3.Connection, bfo_events: list[dict], date_
     "event" splits on bestfightodds), not a guaranteed-complete backfill. See
     fetcher.fetch_bestfightodds_candidates for the known coverage limits.
 
-    Idempotent: clears previously-stored bestfightodds rows before
-    re-inserting, so re-running this against a growing odds_bestfightodds.json
-    (e.g. after a later, wider backfill) doesn't duplicate rows the way a
-    plain INSERT without this would -- unlike fighters/fights/events, the
-    odds table has no natural per-row upsert key to conflict on (a fighter
-    can have several legitimate rows: one per sportsbook).
+    Idempotent: clears previously-stored *non-live* bestfightodds rows
+    before re-inserting, so re-running this against a growing
+    odds_bestfightodds.json (e.g. after a later, wider backfill) doesn't
+    duplicate rows the way a plain INSERT without this would -- unlike
+    fighters/fights/events, the odds table has no natural per-row upsert
+    key to conflict on (a fighter can have several legitimate rows: one per
+    sportsbook). Scoped to exclude odds_type='live' specifically so this
+    doesn't wipe out match_and_store_live_odds' rows when both run in the
+    same cleaner pass -- they're two independent, differently-scoped
+    idempotent writers sharing one table.
     """
-    conn.execute("DELETE FROM odds WHERE source = 'bestfightodds'")
+    conn.execute("DELETE FROM odds WHERE source = 'bestfightodds' AND odds_type != 'live'")
 
     our_fights = conn.execute(
         """
@@ -415,6 +419,161 @@ def match_and_store_odds(conn: sqlite3.Connection, bfo_events: list[dict], date_
     return len(matched_fights)
 
 
+def match_and_store_live_odds(conn: sqlite3.Connection, bfo_events: list[dict], date_tolerance_days: int = 3) -> int:
+    """Same name+date matching as match_and_store_odds, but sourced from
+    upcoming_fights instead of fights, and always stored with fight_id=NULL,
+    odds_type='live'.
+
+    fight_id is NULL deliberately, not a bug: odds.fight_id has a strict
+    foreign key to fights(fight_id), and an upcoming bout isn't in that
+    table (see upcoming_fights' docstring on why they're kept separate).
+    market.market_probabilities_for_matchup already reads exactly this shape
+    of row (`fight_id IS NULL AND fighter_id IN (?, ?) AND odds_type='live'`)
+    -- this is the write side of a read path that already existed.
+
+    Idempotent within its own scope: clears prior odds_type='live' rows
+    before inserting (a live line changes constantly as a fight approaches,
+    so "replace," not "append," is correct) -- deliberately does NOT touch
+    odds_type='close'/'unverified' rows, which match_and_store_odds owns.
+    """
+    conn.execute("DELETE FROM odds WHERE source = 'bestfightodds' AND odds_type = 'live'")
+
+    upcoming = conn.execute(
+        """
+        SELECT u.fight_id, u.event_date, u.fighter_1_id, u.fighter_2_id,
+               f1.name AS f1_name, f2.name AS f2_name
+        FROM upcoming_fights u
+        JOIN fighters f1 ON f1.fighter_id = u.fighter_1_id
+        JOIN fighters f2 ON f2.fighter_id = u.fighter_2_id
+        """
+    ).fetchall()
+
+    by_name_pair: dict[frozenset, list[sqlite3.Row]] = {}
+    for row in upcoming:
+        key = frozenset({normalize_fighter_name(row["f1_name"]), normalize_fighter_name(row["f2_name"])})
+        by_name_pair.setdefault(key, []).append(row)
+
+    now = _now()
+    odds_rows = []
+    matched_fights = set()
+
+    for event in bfo_events:
+        event_date = parse_event_date(event.get("event_date_raw"))
+        for matchup in event.get("matchups", []):
+            fighters = matchup.get("fighters", [])
+            if len(fighters) != 2:
+                continue
+            key = frozenset(normalize_fighter_name(f["fighter_name"]) for f in fighters)
+            candidates = by_name_pair.get(key, [])
+
+            best = None
+            if event_date:
+                event_dt = datetime.fromisoformat(event_date).date()
+                for row in candidates:
+                    row_dt = datetime.fromisoformat(row["event_date"]).date()
+                    if abs((row_dt - event_dt).days) <= date_tolerance_days:
+                        best = row
+                        break
+            elif len(candidates) == 1:
+                best = candidates[0]
+
+            if best is None:
+                continue
+
+            name_to_fighter_id = {
+                normalize_fighter_name(best["f1_name"]): best["fighter_1_id"],
+                normalize_fighter_name(best["f2_name"]): best["fighter_2_id"],
+            }
+            matched_fights.add(best["fight_id"])
+
+            for f in fighters:
+                fighter_id = name_to_fighter_id.get(normalize_fighter_name(f["fighter_name"]))
+                opponent_name = next((o["fighter_name"] for o in fighters if o is not f), None)
+                for book, american in f.get("odds", {}).items():
+                    odds_rows.append(
+                        (
+                            None,  # fight_id: deliberately NULL, see docstring
+                            fighter_id,
+                            f["fighter_name"],
+                            opponent_name,
+                            book,
+                            "live",
+                            american,
+                            _american_to_decimal(american),
+                            event.get("event_date_raw"),
+                            event.get("last_change_raw"),
+                            parse_last_change(event.get("last_change_raw")),
+                            now,
+                            "bestfightodds",
+                        )
+                    )
+
+    conn.executemany(
+        """
+        INSERT INTO odds (
+            fight_id, fighter_id, fighter_name_raw, opponent_name_raw, sportsbook,
+            odds_type, american_odds, decimal_odds, event_date_raw, last_change_raw,
+            last_change_utc, captured_at, source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        odds_rows,
+    )
+    conn.commit()
+    return len(matched_fights)
+
+
+def upsert_upcoming_card(conn: sqlite3.Connection, events: list[dict], fights: list[dict]) -> int:
+    """Replaces upcoming_fights wholesale with the current snapshot. Unlike
+    completed events/fights (which only ever grow), an upcoming card changes
+    shape between refreshes -- fighters get pulled or swapped, fights get
+    added -- so the right model is "this is the current truth," not
+    "append what's new." Rows referencing a fighter_id not yet in the
+    fighters table (a brand-new promotional debut) will fail their foreign
+    key -- callers must upsert_fighters with that fighter's bio first (see
+    fetcher.fetch_upcoming_card's fighter_ids / _fetch_missing_fighters).
+    """
+    conn.execute("DELETE FROM upcoming_fights")
+
+    event_lookup = {e["event_id"]: e for e in events}
+    rows = []
+    skipped = []
+    for f in fights:
+        event = event_lookup.get(f["event_id"], {})
+        event_date = parse_event_date(f.get("event_date_raw") or event.get("event_date_raw"))
+        if event_date is None:
+            skipped.append(f.get("fight_id"))
+            continue
+        rows.append(
+            (
+                f["fight_id"],
+                f["event_id"],
+                f.get("event_name") or event.get("name"),
+                event_date,
+                f.get("location") or event.get("location"),
+                f.get("weight_class"),
+                int(bool(f.get("title_fight"))),
+                f["fighter_1_id"],
+                f["fighter_2_id"],
+                f.get("source_url"),
+                _now(),
+            )
+        )
+    if skipped:
+        print(f"cleaner: skipped {len(skipped)} upcoming fights with unparseable dates: {skipped}")
+
+    conn.executemany(
+        """
+        INSERT INTO upcoming_fights (
+            fight_id, event_id, event_name, event_date, location,
+            weight_class, title_fight, fighter_1_id, fighter_2_id, source_url, scraped_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+    return len(rows)
+
+
 def run(db_path: Path = DB_PATH) -> None:
     conn = get_connection(db_path)
     init_db(conn)
@@ -440,6 +599,25 @@ def run(db_path: Path = DB_PATH) -> None:
     if bfo_events is not None:
         n_matched = match_and_store_odds(conn, bfo_events)
         print(f"cleaner: matched odds for {n_matched} fights from {len(bfo_events)} bestfightodds events")
+
+    # Upcoming card must land before live-odds matching below -- that step
+    # matches against the upcoming_fights table this just populated.
+    try:
+        upcoming_events = load_raw("upcoming_events")
+        upcoming_fights = load_raw("upcoming_fights")
+    except FileNotFoundError:
+        upcoming_events = None
+    if upcoming_events is not None:
+        n_upcoming = upsert_upcoming_card(conn, upcoming_events, upcoming_fights)
+        print(f"cleaner: wrote {n_upcoming} upcoming fights from {len(upcoming_events)} events")
+
+    try:
+        live_bfo_events = load_raw("odds_bestfightodds_live")
+    except FileNotFoundError:
+        live_bfo_events = None
+    if live_bfo_events is not None:
+        n_live_matched = match_and_store_live_odds(conn, live_bfo_events)
+        print(f"cleaner: matched live odds for {n_live_matched} upcoming fights from {len(live_bfo_events)} bestfightodds events")
 
 
 def main() -> None:
