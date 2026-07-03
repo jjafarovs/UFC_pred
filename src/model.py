@@ -47,6 +47,12 @@ FEATURE_COLUMNS = [
     "diff_reach_in",
     "diff_age_years",
     "same_stance",
+    # De-vigged closing market probability (see features.market_prob_feature) --
+    # NaN for the ~91% of historical fights with no matched odds.
+    # HistGradientBoostingClassifier handles this natively; the logistic
+    # pipeline's median-imputer treats missing as "no information" via the
+    # column median, which is a reasonable neutral fallback for a probability.
+    "market_prob_fighter_1",
 ]
 
 

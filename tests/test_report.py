@@ -16,8 +16,10 @@ class _FakeModel:
 
     def __init__(self, prob_fighter_1_win=0.7):
         self.prob = prob_fighter_1_win
+        self.last_X = None
 
     def predict_proba(self, X):
+        self.last_X = X
         n = len(X)
         return np.column_stack([np.full(n, 1 - self.prob), np.full(n, self.prob)])
 
@@ -82,6 +84,18 @@ def test_build_card_report_includes_market_data_when_odds_exist(tmp_path):
     row = result.iloc[0]
     assert row["market_prob_fighter_1"] is not None
     assert row["edge_fighter_1"] == pytest.approx(0.7 - row["market_prob_fighter_1"])
+
+    # market_prob_fighter_1 must reach the model as an input feature, not just get
+    # used afterward for the edge calc -- it's part of model.FEATURE_COLUMNS now.
+    assert "market_prob_fighter_1" in fake_model.last_X.columns
+    assert fake_model.last_X["market_prob_fighter_1"].iloc[0] == pytest.approx(row["market_prob_fighter_1"])
+
+
+def test_build_card_report_passes_nan_market_prob_to_model_when_unavailable(tmp_path):
+    conn = _db_with_history(tmp_path)
+    fake_model = _FakeModel(prob_fighter_1_win=0.7)
+    report.build_card_report(conn, fake_model, [("fA", "fB")], as_of_date="2026-06-01", odds_type="live")
+    assert pd.isna(fake_model.last_X["market_prob_fighter_1"].iloc[0])
 
 
 def test_build_card_report_confidence_reflects_prior_fight_counts(tmp_path):

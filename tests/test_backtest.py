@@ -14,6 +14,7 @@ def _make_matrix(n=200, seed=0):
     prob = 1 / (1 + np.exp(-1.2 * diff_win_pct))
     label = rng.binomial(1, prob)
     dates = pd.date_range("2020-01-01", periods=n, freq="7D").astype(str)
+    market_prob = np.where(rng.uniform(0, 1, n) < 0.1, rng.uniform(0.1, 0.9, n), np.nan)
     return pd.DataFrame(
         {
             "fight_id": [f"f{i}" for i in range(n)],
@@ -32,6 +33,7 @@ def _make_matrix(n=200, seed=0):
             "diff_reach_in": rng.uniform(-6, 6, n),
             "diff_age_years": rng.uniform(-10, 10, n),
             "same_stance": rng.choice([True, False], n),
+            "market_prob_fighter_1": market_prob,
         }
     )
 

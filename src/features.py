@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from src import market
+
 DB_PATH = Path(__file__).resolve().parent.parent / "db" / "ufc.db"
 PROCESSED_DIR = Path(__file__).resolve().parent.parent / "data" / "processed"
 
@@ -187,6 +189,35 @@ def matchup_feature_dict(conn: sqlite3.Connection, fighter_1_id: str, fighter_2_
     }
 
 
+def market_prob_feature(conn: sqlite3.Connection, fight_id: str, fighter_1_id: str, odds_type: str = "close") -> float | None:
+    """De-vigged market-implied probability that fighter_1 wins, from this
+    fight's own historical odds. None where no odds are matched for this
+    fight (currently ~9% coverage across full history -- see README).
+
+    Added as a feature (not just a downstream edge comparison) after
+    confirming empirically that the model's raw, uncalibrated predictions
+    systematically compress toward 0.5 relative to the market: fights the
+    model calls a near-toss-up (0.4-0.6) split into true favorites that
+    actually win ~72% of the time and true underdogs that win only ~29% --
+    at the SAME predicted probability. No calibration scheme can fix that
+    (a 1-D reshaping of the model's own score can't inject information the
+    raw features don't have); giving the model direct access to what the
+    market already knows can. HistGradientBoostingClassifier's native NaN
+    handling makes this safe to add despite the coverage gap: the ~9% of
+    rows where it's present still teach the model a strong relationship,
+    and rows without it just fall back to the other ten features.
+
+    NOT a leakage risk relative to the fight itself: a closing line is
+    contemporaneous with the fight (the market's last price right before it
+    starts), not information from after it. It IS a real train/production
+    mismatch worth documenting: this trains on the eventual CLOSING line,
+    but report.py's live use (a fight that hasn't happened yet) only has
+    access to whatever the CURRENT line is (`odds_type='live'`), which may
+    be less sharp than what the closing line eventually becomes.
+    """
+    return market.market_probabilities_for_fight(conn, fight_id, odds_type=odds_type).get(fighter_1_id)
+
+
 def build_fight_feature_row(conn: sqlite3.Connection, fight: sqlite3.Row, n: int = 5) -> dict | None:
     """One training row for a completed fight: fighter_1-minus-fighter_2
     feature differences, as of the day of the fight, plus the label. Returns
@@ -204,6 +235,7 @@ def build_fight_feature_row(conn: sqlite3.Connection, fight: sqlite3.Row, n: int
             "fighter_1_id": fight["fighter_1_id"],
             "fighter_2_id": fight["fighter_2_id"],
             "label_fighter_1_win": 1 if fight["result"] == "fighter_1" else 0,
+            "market_prob_fighter_1": market_prob_feature(conn, fight["fight_id"], fight["fighter_1_id"]),
         }
     )
     return row

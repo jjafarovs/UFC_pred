@@ -99,15 +99,27 @@ def build_card_report(
 ) -> pd.DataFrame:
     """One row per matchup: model probability, de-vigged market probability
     (if odds are available for it), edge, and a confidence label.
+
+    Market probability is looked up BEFORE prediction, not just after --
+    it's one of model.FEATURE_COLUMNS now (see features.market_prob_feature
+    for why), so the model needs it as an input, not only as a downstream
+    number to compare against. For a genuinely upcoming matchup this uses
+    whatever the CURRENT line is (`odds_type='live'` by default), which is
+    the real-world equivalent of what a live prediction would have access
+    to -- see the train/production mismatch noted in
+    features.market_prob_feature's docstring (training uses the eventual
+    CLOSING line, which is typically sharper than a live pre-fight price).
     """
     rows = []
     for fighter_1_id, fighter_2_id in matchups:
+        market_probs = market.market_probabilities_for_matchup(conn, fighter_1_id, fighter_2_id, odds_type=odds_type)
+        market_prob = market_probs.get(fighter_1_id)
+
         feat = features.matchup_feature_dict(conn, fighter_1_id, fighter_2_id, as_of_date, n=n)
+        feat["market_prob_fighter_1"] = market_prob
         X = pd.DataFrame([feat])[model.FEATURE_COLUMNS].astype(float)
         model_prob = float(fitted_model.predict_proba(X)[0, 1])
 
-        market_probs = market.market_probabilities_for_matchup(conn, fighter_1_id, fighter_2_id, odds_type=odds_type)
-        market_prob = market_probs.get(fighter_1_id)
         edge = market.compute_edge(model_prob, market_prob) if market_prob is not None else None
 
         rows.append(

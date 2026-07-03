@@ -128,6 +128,47 @@ def test_build_feature_matrix_uses_only_past_fights_per_row(fighter_a_history):
     assert row3["label_fighter_1_win"] == 1  # fA won fight3
 
 
+def test_market_prob_feature_returns_none_when_no_odds_matched(fighter_a_history):
+    conn = fighter_a_history
+    assert features.market_prob_feature(conn, "fight1", "fA") is None
+
+
+def test_market_prob_feature_returns_devigged_probability_when_odds_exist(fighter_a_history):
+    conn = fighter_a_history
+    conn.execute(
+        "INSERT INTO odds (fight_id, fighter_id, fighter_name_raw, sportsbook, odds_type, american_odds, decimal_odds, captured_at, source) "
+        "VALUES ('fight1', 'fA', 'Fighter A', 'BookOne', 'close', -150, 1.6667, 'now', 'test')"
+    )
+    conn.execute(
+        "INSERT INTO odds (fight_id, fighter_id, fighter_name_raw, sportsbook, odds_type, american_odds, decimal_odds, captured_at, source) "
+        "VALUES ('fight1', 'fB', 'Fighter B', 'BookOne', 'close', 130, 2.3, 'now', 'test')"
+    )
+    conn.commit()
+    prob = features.market_prob_feature(conn, "fight1", "fA")
+    assert prob is not None
+    assert 0.5 < prob < 0.7  # fA is the favorite here
+
+
+def test_build_fight_feature_row_includes_market_prob_when_available(fighter_a_history):
+    conn = fighter_a_history
+    conn.execute(
+        "INSERT INTO odds (fight_id, fighter_id, fighter_name_raw, sportsbook, odds_type, american_odds, decimal_odds, captured_at, source) "
+        "VALUES ('fight1', 'fA', 'Fighter A', 'BookOne', 'close', -150, 1.6667, 'now', 'test')"
+    )
+    conn.execute(
+        "INSERT INTO odds (fight_id, fighter_id, fighter_name_raw, sportsbook, odds_type, american_odds, decimal_odds, captured_at, source) "
+        "VALUES ('fight1', 'fB', 'Fighter B', 'BookOne', 'close', 130, 2.3, 'now', 'test')"
+    )
+    conn.commit()
+    fight = conn.execute("SELECT * FROM fights WHERE fight_id='fight1'").fetchone()
+    row = features.build_fight_feature_row(conn, fight)
+    assert row["market_prob_fighter_1"] is not None
+
+    fight2 = conn.execute("SELECT * FROM fights WHERE fight_id='fight2'").fetchone()
+    row2 = features.build_fight_feature_row(conn, fight2)
+    assert row2["market_prob_fighter_1"] is None  # fight2 has no matched odds
+
+
 def test_draws_and_no_contests_are_excluded_from_the_matrix(tmp_path):
     conn = _make_db(tmp_path)
     _insert_fighter(conn, "fA", "Fighter A")

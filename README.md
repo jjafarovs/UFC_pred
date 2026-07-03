@@ -132,13 +132,17 @@ hitting the network again.
     inline dates, and fetches only the events on/after a `since_date` cutoff
     — one popular fighter's profile can surface many relevant events at
     once, far cheaper than searching per-event or per-fight. Backfilling
-    just the last 2 years this way (84 target events, one fighter lookup
-    each, ~9.5 minutes) brought coverage in that window from ~2% to
-    **79.3%** (814 of 1,027 fights). Full-history odds coverage was
-    deliberately *not* pursued the same way — the last 2 years is where a
-    backtest has the most practical relevance, and extending further back
-    is explicitly left as a "decide based on what these results show" step
-    (see Walk-forward backtest).
+    the last 2 years this way (84 target events, ~9.5 minutes) first brought
+    coverage in that window from ~2% to 79.3% (814 of 1,027 fights) — later
+    extended to a 5-year window (212 target events, ~26 minutes) once a real
+    need for it emerged (see Walk-forward backtest: a market-probability
+    feature only helps if it's present during *training*, not just in the
+    test period, which required pushing coverage further back than the
+    initial 2-year window). Result: **2,164 fights matched** across full
+    history. Extending to the *entire* 30-year history was deliberately not
+    pursued the same way — very old fights likely have thin-to-no odds data
+    on bestfightodds regardless of effort, and 5 years already gives the
+    walk-forward training window real coverage.
 - Fighter/fight matching across the two sources is name-based (see
   `cleaner.normalize_fighter_name`) plus an event-date tolerance window —
   it's a best-effort join over two independently-formatted sources, not a
@@ -173,6 +177,21 @@ all 780 ufcstats events / 8,758 fights / 2,710 fighters loaded, 74.6% of the
 ~0% respectively on the initial 302-fight sample. The as-of-date logic never
 changed; this is purely the data-volume fix the small sample was always
 missing, confirming the earlier caveat was about sample size, not a bug.
+
+**Later addition: `market_prob_fighter_1`** (`features.market_prob_feature`)
+-- the de-vigged closing market probability for a fight, added as an actual
+model input after finding the model's raw predictions were systematically
+compressed toward 50/50 relative to reality in a way calibration couldn't
+fix (see Walk-forward backtest for the full diagnosis). Not a leakage risk
+relative to the fight itself -- a closing line is contemporaneous with the
+fight, not information from after it -- but it does create a real
+train/production mismatch worth knowing: it trains on the eventual
+*closing* line, while `report.py`'s live use of an upcoming fight only has
+access to whatever the *current* line is, which may be less sharp than what
+the closing line eventually becomes. Only ~25% of historical fights have
+this feature populated (NaN elsewhere); `HistGradientBoostingClassifier`
+handles that natively, and the logistic pipeline's median-imputer treats a
+missing value as neutral.
 
 ## Model + calibration
 
@@ -354,11 +373,85 @@ specifically. That's not noise; it's a consistent, systematic property of
 the model's output. It means the model's probability estimates specifically
 in the lower-probability (underdog) range are running more optimistic than
 the market's de-vigged consensus, across thousands of walk-forward
-predictions. This is a concrete, actionable lead for future feature/model
-work — e.g. checking calibration quality split by favorite vs. underdog
-separately (the aggregate calibration table hides this asymmetry), rather
-than a reason to expect the next feature added will just fix things
-generally.
+predictions.
+
+### Root-causing the underdog bias: a real feature-signal gap, not a calibration bug
+
+Splitting walk-forward predictions by *market*-defined favorite/underdog
+(943 fights) confirmed the mechanism precisely: the model was systematically
+**compressing predictions toward 50/50** relative to reality. Fights the
+model called a near-toss-up (0.4-0.6) that were actually market favorites
+won 72% of the time; ones that were actually market underdogs won only 29%
+of the time — at the *same* predicted probability. `edge = model_prob −
+market_prob` is mechanically negative for favorites under this bias (never
+crosses the bet threshold) and mechanically positive for underdogs (crosses
+constantly) — the "underdog value" was never real signal, it was a
+compression artifact.
+
+Checked whether this was fixable by calibration (it wasn't, and this is
+worth knowing generally, not just here): the **raw, uncalibrated** model
+showed the identical compression (favorites: predicted 58.6% vs. actual
+70.7%; underdogs: predicted 41.4% vs. actual 29.3% — essentially identical
+numbers to the calibrated model). Since a calibrator only reshapes an
+existing 1-D score, it can't fix a bias that depends on information
+(favorite/underdog status) the raw score doesn't carry. The earlier
+aggregate calibration table looked fine specifically *because* the
+favorite and underdog biases point in opposite directions and cancel out
+in the marginal view — a real methodological trap.
+
+**Fix: added the de-vigged closing market probability as a model input**
+(`market_prob_fighter_1`, `features.market_prob_feature`) — not just a
+downstream comparison, an actual feature the model trains on. Validated the
+hypothesis first on a small held-out slice before committing to it: on the
+805 fights that had matched odds at the time, a model trained *without* this
+feature scored AUC 0.504 (random) with the same severe compression; the
+identical setup *with* the feature scored AUC 0.682, and the favorite/
+underdog gap shrank markedly. It only works, though, if the feature is
+actually present during *training* — the first backfill (2-year window)
+concentrated all matched odds in the most recent slice of history, which
+fell entirely in the walk-forward *test* period and never in training; the
+model had literally never seen a non-null example of it, and adding it
+changed nothing. Extending the odds backfill to a 5-year window (`db/`:
+2,164 fights matched, up from 814) fixed this — 1,191 covered fights now
+fall inside the walk-forward training window, not just the test window.
+
+**Result, on the real full walk-forward pipeline**: favorite/underdog gap
+shrank from ~0.12-0.15 to **0.044** (logistic) / 0.084 (GBM). Overall
+walk-forward accuracy rose from 62.5% to **68.6%** (logistic), with a
+calibration table now tracking closely across every bin (e.g. the 0.7-0.8
+bin: 74.5% predicted vs. 74.7% actual, n=186).
+
+**But the honest bottom line got sharper, not better.** Re-running the
+bootstrap significance test on the improved model: at the default 5% edge
+threshold, logistic regression's 470 edge-flagged bets return ROI −9.8%
+with a 95% CI of **[−19.2%, −0.3%] — this excludes zero.** For the first
+time in this investigation, a result is statistically significant. It's a
+significant *loss*, not a null result. Sweeping the threshold from 3% to
+15% (`t=0.03`: 638 bets, CI `[−18.2%, −2.1%]`, significant; `t=0.05`: 470
+bets, significant; `t=0.08` through `0.15`: point estimate stays negative
+throughout, just loses significance as the sample shrinks) shows the same
+story every time: the point estimate never once turns positive, and the
+large-sample cases are confidently negative. GBM's result at the default
+threshold (656 bets, ROI −7.3%, CI `[−17.1%, +2.5%]`) doesn't reach
+significance but is directionally the same.
+
+**What this means, precisely**: once the model has access to what the
+market already knows (fixing the compression bug), the fights where our
+*other* ten features still pull the prediction away from the market's price
+are, with statistical confidence, worse bets than the market's own price —
+not merely "no better." Our current stat-based features (rolling form,
+striking/takedown rates, physical diffs, layoff days) are not adding real
+incremental signal on top of the market; where they disagree with it, on
+this evidence, they're adding noise. That's a substantive, specific
+conclusion — not "we don't know," but "our current features are net
+anti-predictive in exactly the cases the whole project is designed to
+flag." Next steps worth pursuing based on this: features that are more
+likely to carry information the market hasn't already priced in (personnel
+changes, weight-cut/health signals, style-matchup-specific modeling) rather
+than more of the same box-score statistics, and being explicit that a
+model built this way is not competing with the market from scratch anymore
+— it's testing whether anything beats an already-informed baseline, a
+harder and more honest bar.
 
 ## Reporting
 
