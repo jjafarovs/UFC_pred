@@ -33,6 +33,9 @@ def _make_matrix(n=100, seed=0):
             "diff_reach_in": rng.uniform(-6, 6, n),
             "diff_age_years": rng.uniform(-10, 10, n),
             "same_stance": rng.choice([True, False], n),
+            "diff_total_prior_fights": rng.integers(-10, 10, n).astype(float),
+            "diff_finish_rate": rng.uniform(-0.5, 0.5, n),
+            "diff_times_finished_rate": rng.uniform(-0.5, 0.5, n),
             "market_prob_fighter_1": market_prob,
         }
     )

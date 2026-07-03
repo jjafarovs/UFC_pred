@@ -83,6 +83,32 @@ def load_calibration_table(model_path: Path) -> list[dict] | None:
     return metrics.get("calibration_table")
 
 
+def load_feature_columns(model_path: Path) -> list[str]:
+    """Reads the exact feature column list a model artifact was trained
+    with, from its sibling .json metadata (model.save_model_artifact stores
+    this). Falls back to the current model.FEATURE_COLUMNS only if metadata
+    is missing entirely (an artifact saved before this was tracked) --
+    that's a last resort, not the normal path.
+
+    This exists specifically so a deliberately pinned/older production model
+    (see load_production_model) keeps working correctly even after
+    model.FEATURE_COLUMNS later gains new features, rather than crashing
+    with scikit-learn's "feature names unseen at fit time" error. Caught in
+    practice, not hypothetically: production.json was pinned to a model
+    trained before diff_total_prior_fights/diff_finish_rate/
+    diff_times_finished_rate existed (they didn't validate in the backtest,
+    so that older model was deliberately kept as production), and the
+    dashboard broke the moment those got added to FEATURE_COLUMNS -- because
+    build_card_report was building its feature vector from the current
+    code's column list, not from what the loaded model actually expects.
+    """
+    meta_path = model_path.with_suffix(".json")
+    if not meta_path.exists():
+        return model.FEATURE_COLUMNS
+    meta = json.loads(meta_path.read_text())
+    return meta.get("feature_columns", model.FEATURE_COLUMNS)
+
+
 def fighter_display_name(conn: sqlite3.Connection, fighter_id: str) -> str:
     row = conn.execute("SELECT name FROM fighters WHERE fighter_id = ?", (fighter_id,)).fetchone()
     return row[0] if row else fighter_id
@@ -130,6 +156,7 @@ def build_card_report(
     odds_type: str = "live",
     n: int = 5,
     calibration_table: list[dict] | None = None,
+    feature_columns: list[str] | None = None,
 ) -> pd.DataFrame:
     """One row per matchup: model probability, de-vigged market probability
     (if odds are available for it), edge, and a confidence label.
@@ -143,7 +170,15 @@ def build_card_report(
     to -- see the train/production mismatch noted in
     features.market_prob_feature's docstring (training uses the eventual
     CLOSING line, which is typically sharper than a live pre-fight price).
+
+    `feature_columns` should almost always come from `load_feature_columns
+    (model_path)`, not be left as the default -- it must match exactly what
+    `fitted_model` was actually trained with, which can lag behind the
+    current code's `model.FEATURE_COLUMNS` for a deliberately pinned older
+    model (see load_feature_columns's docstring for a real case where
+    skipping this broke the dashboard).
     """
+    feature_columns = feature_columns if feature_columns is not None else model.FEATURE_COLUMNS
     rows = []
     for fighter_1_id, fighter_2_id in matchups:
         market_probs = market.market_probabilities_for_matchup(conn, fighter_1_id, fighter_2_id, odds_type=odds_type)
@@ -151,7 +186,7 @@ def build_card_report(
 
         feat = features.matchup_feature_dict(conn, fighter_1_id, fighter_2_id, as_of_date, n=n)
         feat["market_prob_fighter_1"] = market_prob
-        X = pd.DataFrame([feat])[model.FEATURE_COLUMNS].astype(float)
+        X = pd.DataFrame([feat])[feature_columns].astype(float)
         model_prob = float(fitted_model.predict_proba(X)[0, 1])
 
         edge = market.compute_edge(model_prob, market_prob) if market_prob is not None else None
@@ -193,10 +228,12 @@ def main() -> None:
     conn.row_factory = sqlite3.Row
     fitted_model, model_path = load_latest_model(args.model)
     calibration_table = load_calibration_table(model_path)
+    feature_columns = load_feature_columns(model_path)
     print(f"report.py: using model {model_path.name}, as of {as_of_date}")
 
     report = build_card_report(
-        conn, fitted_model, matchups, as_of_date, odds_type=args.odds_type, calibration_table=calibration_table
+        conn, fitted_model, matchups, as_of_date, odds_type=args.odds_type,
+        calibration_table=calibration_table, feature_columns=feature_columns,
     )
     print(report.to_string(index=False))
 

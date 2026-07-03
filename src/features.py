@@ -36,7 +36,7 @@ def fights_before(conn: sqlite3.Connection, fighter_id: str, as_of_date: str, n:
     """
     query = """
         SELECT
-            f.fight_id, f.event_date, f.winner_id, f.result,
+            f.fight_id, f.event_date, f.winner_id, f.result, f.method,
             fs_self.sig_str_landed AS self_sig_landed, fs_self.sig_str_attempted AS self_sig_attempted,
             fs_self.takedowns_landed AS self_td_landed, fs_self.takedowns_attempted AS self_td_attempted,
             fs_opp.sig_str_landed AS opp_sig_landed, fs_opp.sig_str_attempted AS opp_sig_attempted,
@@ -152,6 +152,38 @@ def fighter_physical_features(conn: sqlite3.Connection, fighter_id: str, as_of_d
     }
 
 
+_FINISH_METHODS = {"KO/TKO", "Submission"}
+
+
+def fighter_career_features(conn: sqlite3.Connection, fighter_id: str, as_of_date: str) -> dict:
+    """Career-long (NOT windowed to last N) aggregates: total prior fights,
+    finish rate among wins, and how often the fighter has been finished
+    among losses. Distinct from fighter_rolling_features' last-N window on
+    purpose -- a 15-fight veteran and a 2-fight prospect can show identical
+    last-5-fight stats, and this is exactly the kind of gap the project's
+    walk-forward backtest flagged as worth closing with real features rather
+    than leaning further on the market probability feature (see README's
+    Walk-forward backtest section). Uses fights_before with n=None (the
+    full as-of-date-safe history), so it's leak-free by the same
+    construction as every other feature here -- not a separate query path.
+    """
+    rows = fights_before(conn, fighter_id, as_of_date, n=None)
+    total_prior_fights = len(rows)
+    if total_prior_fights == 0:
+        return {"total_prior_fights": 0, "finish_rate": None, "times_finished_rate": None}
+
+    wins = [r for r in rows if r["winner_id"] == fighter_id]
+    losses = [r for r in rows if r["result"] in ("fighter_1", "fighter_2") and r["winner_id"] != fighter_id]
+    finishes = sum(1 for r in wins if r["method"] in _FINISH_METHODS)
+    times_finished = sum(1 for r in losses if r["method"] in _FINISH_METHODS)
+
+    return {
+        "total_prior_fights": total_prior_fights,
+        "finish_rate": finishes / len(wins) if wins else None,
+        "times_finished_rate": times_finished / len(losses) if losses else None,
+    }
+
+
 def matchup_feature_dict(conn: sqlite3.Connection, fighter_1_id: str, fighter_2_id: str, as_of_date: str, n: int = 5) -> dict:
     """The feature computation shared by build_fight_feature_row (training,
     where the matchup is a completed fight already in the DB) and report.py
@@ -163,6 +195,8 @@ def matchup_feature_dict(conn: sqlite3.Connection, fighter_1_id: str, fighter_2_
     f2_roll = fighter_rolling_features(conn, fighter_2_id, as_of_date, n=n)
     f1_phys = fighter_physical_features(conn, fighter_1_id, as_of_date)
     f2_phys = fighter_physical_features(conn, fighter_2_id, as_of_date)
+    f1_career = fighter_career_features(conn, fighter_1_id, as_of_date)
+    f2_career = fighter_career_features(conn, fighter_2_id, as_of_date)
 
     def diff(key, d1, d2):
         v1, v2 = d1.get(key), d2.get(key)
@@ -181,6 +215,9 @@ def matchup_feature_dict(conn: sqlite3.Connection, fighter_1_id: str, fighter_2_
         "diff_height_in": diff("height_in", f1_phys, f2_phys),
         "diff_reach_in": diff("reach_in", f1_phys, f2_phys),
         "diff_age_years": diff("age_years", f1_phys, f2_phys),
+        "diff_total_prior_fights": diff("total_prior_fights", f1_career, f2_career),
+        "diff_finish_rate": diff("finish_rate", f1_career, f2_career),
+        "diff_times_finished_rate": diff("times_finished_rate", f1_career, f2_career),
         "same_stance": (
             f1_phys["stance"] == f2_phys["stance"]
             if f1_phys["stance"] and f2_phys["stance"]

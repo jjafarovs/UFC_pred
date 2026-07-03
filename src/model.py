@@ -47,6 +47,13 @@ FEATURE_COLUMNS = [
     "diff_reach_in",
     "diff_age_years",
     "same_stance",
+    # Career-long (not last-N) features, added specifically to give the model
+    # signal beyond what it can lean on the market feature for -- see
+    # features.fighter_career_features and the README's Walk-forward
+    # backtest section on why "more market-following" alone wasn't the fix.
+    "diff_total_prior_fights",
+    "diff_finish_rate",
+    "diff_times_finished_rate",
     # De-vigged closing market probability (see features.market_prob_feature) --
     # NaN for the ~91% of historical fights with no matched odds.
     # HistGradientBoostingClassifier handles this natively; the logistic

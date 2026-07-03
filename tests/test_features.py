@@ -27,15 +27,15 @@ def _insert_event(conn, event_id, name, event_date):
     )
 
 
-def _insert_fight(conn, fight_id, event_id, event_date, f1, f2, winner, stats):
+def _insert_fight(conn, fight_id, event_id, event_date, f1, f2, winner, stats, method=None):
     """stats: {f1: {sig_l, sig_a, td_l, td_a}, f2: {...}}"""
     conn.execute(
         """
         INSERT INTO fights (fight_id, event_id, event_date, fighter_1_id, fighter_2_id,
-                             winner_id, result, scraped_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'now')
+                             winner_id, result, method, scraped_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'now')
         """,
-        (fight_id, event_id, event_date, f1, f2, winner, "fighter_1" if winner == f1 else "fighter_2"),
+        (fight_id, event_id, event_date, f1, f2, winner, "fighter_1" if winner == f1 else "fighter_2", method),
     )
     for fighter, s in stats.items():
         conn.execute(
@@ -167,6 +167,49 @@ def test_build_fight_feature_row_includes_market_prob_when_available(fighter_a_h
     fight2 = conn.execute("SELECT * FROM fights WHERE fight_id='fight2'").fetchone()
     row2 = features.build_fight_feature_row(conn, fight2)
     assert row2["market_prob_fighter_1"] is None  # fight2 has no matched odds
+
+
+@pytest.fixture
+def fighter_a_career_history(tmp_path):
+    """Fighter A: KO win vs B, decision win vs C, submission loss vs D, all
+    before 2026-06-01 -- 3 prior fights, 2 wins (1 finish), 1 loss (a finish).
+    """
+    conn = _make_db(tmp_path)
+    for fid, name in [("fA", "Fighter A"), ("fB", "Fighter B"), ("fC", "Fighter C"), ("fD", "Fighter D")]:
+        _insert_fighter(conn, fid, name)
+    _insert_event(conn, "e1", "Event 1", "2026-01-01")
+    _insert_event(conn, "e2", "Event 2", "2026-02-01")
+    _insert_event(conn, "e3", "Event 3", "2026-03-01")
+
+    stats = {"fA": {"sig_l": 10, "sig_a": 20, "td_l": 0, "td_a": 0}, "fB": {"sig_l": 5, "sig_a": 15, "td_l": 0, "td_a": 0}}
+    _insert_fight(conn, "fight1", "e1", "2026-01-01", "fA", "fB", "fA", stats, method="KO/TKO")
+    stats2 = {"fA": {"sig_l": 10, "sig_a": 20, "td_l": 0, "td_a": 0}, "fC": {"sig_l": 5, "sig_a": 15, "td_l": 0, "td_a": 0}}
+    _insert_fight(conn, "fight2", "e2", "2026-02-01", "fA", "fC", "fA", stats2, method="Decision - Unanimous")
+    stats3 = {"fA": {"sig_l": 10, "sig_a": 20, "td_l": 0, "td_a": 0}, "fD": {"sig_l": 5, "sig_a": 15, "td_l": 0, "td_a": 0}}
+    _insert_fight(conn, "fight3", "e3", "2026-03-01", "fD", "fA", "fD", stats3, method="Submission")
+    conn.commit()
+    return conn
+
+
+def test_fighter_career_features_zero_prior_fights(fighter_a_career_history):
+    conn = fighter_a_career_history
+    result = features.fighter_career_features(conn, "fA", "2026-01-01")
+    assert result == {"total_prior_fights": 0, "finish_rate": None, "times_finished_rate": None}
+
+
+def test_fighter_career_features_counts_and_rates(fighter_a_career_history):
+    conn = fighter_a_career_history
+    result = features.fighter_career_features(conn, "fA", "2026-06-01")
+    assert result["total_prior_fights"] == 3
+    assert result["finish_rate"] == pytest.approx(0.5)  # 1 of 2 wins was a finish (KO/TKO, not the decision)
+    assert result["times_finished_rate"] == pytest.approx(1.0)  # the 1 loss was a submission
+
+
+def test_fighter_career_features_only_counts_fights_before_as_of_date(fighter_a_career_history):
+    conn = fighter_a_career_history
+    result = features.fighter_career_features(conn, "fA", "2026-02-01")  # only fight1 counts
+    assert result["total_prior_fights"] == 1
+    assert result["finish_rate"] == pytest.approx(1.0)  # the only win was a KO
 
 
 def test_draws_and_no_contests_are_excluded_from_the_matrix(tmp_path):

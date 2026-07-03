@@ -193,6 +193,36 @@ def test_load_calibration_table_returns_none_when_metadata_missing(tmp_path):
     assert report.load_calibration_table(model_path) is None
 
 
+def test_load_feature_columns_reads_from_sibling_metadata(tmp_path):
+    model_path = tmp_path / "logistic_20260101T000000Z.joblib"
+    model_path.with_suffix(".json").write_text(json.dumps({"feature_columns": ["diff_win_pct", "same_stance"]}))
+    assert report.load_feature_columns(model_path) == ["diff_win_pct", "same_stance"]
+
+
+def test_load_feature_columns_falls_back_to_current_constant_when_metadata_missing(tmp_path):
+    model_path = tmp_path / "logistic_20260101T000000Z.joblib"
+    assert report.load_feature_columns(model_path) == model.FEATURE_COLUMNS
+
+
+def test_build_card_report_uses_an_older_models_own_feature_list_not_the_current_one(tmp_path):
+    """The exact bug this was written to catch: a model trained on an older,
+    shorter feature list must still work via build_card_report, even though
+    model.FEATURE_COLUMNS has since grown -- because build_card_report is
+    told the model's own list explicitly, not defaulting to the module
+    constant.
+    """
+    conn = _db_with_history(tmp_path)
+    old_feature_columns = [c for c in model.FEATURE_COLUMNS if c not in ("diff_total_prior_fights", "diff_finish_rate", "diff_times_finished_rate")]
+    assert len(old_feature_columns) < len(model.FEATURE_COLUMNS)  # sanity: the fixture actually differs
+
+    fake_model = _FakeModel(prob_fighter_1_win=0.6)
+    result = report.build_card_report(
+        conn, fake_model, [("fA", "fB")], as_of_date="2026-06-01", feature_columns=old_feature_columns
+    )
+    assert list(fake_model.last_X.columns) == old_feature_columns
+    assert result.iloc[0]["model_prob_fighter_1"] == pytest.approx(0.6)
+
+
 def test_confidence_label_is_low_when_either_fighter_has_no_history():
     calibration_table = [{"bin_low": 0.5, "bin_high": 0.6, "n": 1000}]
     assert report._confidence_label(0, 5, model_prob=0.55, calibration_table=calibration_table) == "low"

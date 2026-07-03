@@ -196,6 +196,20 @@ this feature populated (NaN elsewhere); `HistGradientBoostingClassifier`
 handles that natively, and the logistic pipeline's median-imputer treats a
 missing value as neutral.
 
+**Another later addition: career-long features** (`features.fighter_career_features`
+-- total prior fights, finish rate among wins, times-finished rate among
+losses). Deliberately *not* windowed to the last N fights like the rolling
+features: a 15-fight veteran and a 2-fight prospect can show identical
+last-5-fight stats, and this was added specifically to give the model a way
+to tell them apart. **Result: no validated improvement** -- the
+favorite/underdog calibration gap (see Walk-forward backtest) was
+unchanged, and the backtest ROI stayed a significant loss for logistic and
+got *worse* for GBM (full drawdown to zero bankroll). Kept in the codebase
+and available for the dashboard's stat breakdown (real, correctly computed
+information either way), but **not promoted to `models/production.json`**
+-- another data point that box-score-derived stats don't seem to carry
+information the market hasn't already priced in.
+
 ## Model + calibration
 
 `src/model.py` trains a baseline (logistic regression, `--model logistic`)
@@ -591,6 +605,40 @@ driving the app in a browser rather than trusting that it imported cleanly
 and the display formatter's `x is None` check missed that, rendering a
 literal `"nan%"` in the UI for any fight without matched odds. Fixed to
 check `pd.isna(x)` instead.
+
+**Fight-detail comparison table**: the per-fighter stat breakdown is a
+genuine side-by-side table (`Stat | Fighter 1 | Fighter 2`), not two
+separate raw-dict dumps — includes career-long stats (total fights,
+finish rate, times-finished rate; see Feature engineering) alongside the
+rolling-window ones, with no "better/worse" color-coding since several of
+these (days since last fight, times finished) don't have a universally
+correct direction.
+
+**Manual refresh, not scheduled.** A launchd-based hourly/daily schedule
+was built and tested, then deliberately abandoned: macOS blocks background
+`launchd` processes from reading files under `~/Desktop` without an
+explicit Full Disk Access grant (confirmed in practice — `PermissionError:
+Operation not permitted` reading `.venv/pyvenv.cfg`), and the user preferred
+a manual refresh over granting that access or moving the project off
+Desktop, since UFC cards don't change fast enough to need always-on
+auto-refresh. Instead, the sidebar has a "Refresh upcoming card + live
+odds" button that runs `refresh.py --mode upcoming` as a normal foreground
+subprocess (no permission issue at all this way, since it's not a
+background daemon) and reruns the page on completion.
+
+**A second real bug, caught the same way** (actually driving the app, not
+just importing it): after adding new career-length features (see Feature
+engineering) to `model.FEATURE_COLUMNS`, the dashboard broke with
+scikit-learn's "feature names unseen at fit time" error. Cause: those new
+features didn't validate in the backtest, so `production.json` was
+deliberately left pinned to an *older* model that never saw them — but
+`build_card_report` was building its input vector from the current code's
+`model.FEATURE_COLUMNS`, not from what that specific pinned model actually
+expects. Fixed by having `report.load_feature_columns` read the exact
+column list out of the model artifact's own saved metadata (already stored
+there by `save_model_artifact`) and threading it through explicitly, so a
+pinned older model keeps working correctly no matter how many new features
+get added to the code later.
 
 ## Setup
 
