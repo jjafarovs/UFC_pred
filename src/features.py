@@ -39,8 +39,10 @@ def fights_before(conn: sqlite3.Connection, fighter_id: str, as_of_date: str, n:
             f.fight_id, f.event_date, f.winner_id, f.result, f.method,
             fs_self.sig_str_landed AS self_sig_landed, fs_self.sig_str_attempted AS self_sig_attempted,
             fs_self.takedowns_landed AS self_td_landed, fs_self.takedowns_attempted AS self_td_attempted,
+            fs_self.control_time_sec AS self_control_time_sec,
             fs_opp.sig_str_landed AS opp_sig_landed, fs_opp.sig_str_attempted AS opp_sig_attempted,
-            fs_opp.takedowns_landed AS opp_td_landed, fs_opp.takedowns_attempted AS opp_td_attempted
+            fs_opp.takedowns_landed AS opp_td_landed, fs_opp.takedowns_attempted AS opp_td_attempted,
+            fs_opp.control_time_sec AS opp_control_time_sec
         FROM fights f
         JOIN fight_stats fs_self
             ON fs_self.fight_id = f.fight_id AND fs_self.fighter_id = :fighter_id AND fs_self.round = 0
@@ -80,6 +82,7 @@ def fighter_rolling_features(conn: sqlite3.Connection, fighter_id: str, as_of_da
         "td_acc": None,
         "td_def": None,
         "days_since_last_fight": None,
+        "control_time_pct": None,
     }
     if n_prior == 0:
         return empty
@@ -108,9 +111,12 @@ def fighter_rolling_features(conn: sqlite3.Connection, fighter_id: str, as_of_da
     self_td_attempted = sum(r["self_td_attempted"] or 0 for r in rows)
     opp_td_landed = sum(r["opp_td_landed"] or 0 for r in rows)
     opp_td_attempted = sum(r["opp_td_attempted"] or 0 for r in rows)
+    self_control_time = sum(r["self_control_time_sec"] or 0 for r in rows)
+    opp_control_time = sum(r["opp_control_time_sec"] or 0 for r in rows)
 
     sig_str_def = _safe_ratio(opp_sig_landed, opp_sig_attempted)
     td_def = _safe_ratio(opp_td_landed, opp_td_attempted)
+    control_time_pct = _safe_ratio(self_control_time, self_control_time + opp_control_time)
 
     most_recent_date = datetime.fromisoformat(rows[0]["event_date"]).date()
     as_of = datetime.fromisoformat(as_of_date).date()
@@ -124,6 +130,7 @@ def fighter_rolling_features(conn: sqlite3.Connection, fighter_id: str, as_of_da
         "td_acc": _safe_ratio(self_td_landed, self_td_attempted),
         "td_def": 1 - td_def if td_def is not None else None,
         "days_since_last_fight": (as_of - most_recent_date).days,
+        "control_time_pct": control_time_pct,
     }
 
 
@@ -218,6 +225,7 @@ def matchup_feature_dict(conn: sqlite3.Connection, fighter_1_id: str, fighter_2_
         "diff_total_prior_fights": diff("total_prior_fights", f1_career, f2_career),
         "diff_finish_rate": diff("finish_rate", f1_career, f2_career),
         "diff_times_finished_rate": diff("times_finished_rate", f1_career, f2_career),
+        "diff_control_time_pct": diff("control_time_pct", f1_roll, f2_roll),
         "same_stance": (
             f1_phys["stance"] == f2_phys["stance"]
             if f1_phys["stance"] and f2_phys["stance"]

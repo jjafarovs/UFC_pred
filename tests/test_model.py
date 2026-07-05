@@ -36,6 +36,7 @@ def _make_matrix(n=100, seed=0):
             "diff_total_prior_fights": rng.integers(-10, 10, n).astype(float),
             "diff_finish_rate": rng.uniform(-0.5, 0.5, n),
             "diff_times_finished_rate": rng.uniform(-0.5, 0.5, n),
+            "diff_control_time_pct": rng.uniform(-0.3, 0.3, n),
             "market_prob_fighter_1": market_prob,
         }
     )

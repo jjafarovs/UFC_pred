@@ -212,7 +212,12 @@ def test_build_card_report_uses_an_older_models_own_feature_list_not_the_current
     constant.
     """
     conn = _db_with_history(tmp_path)
-    old_feature_columns = [c for c in model.FEATURE_COLUMNS if c not in ("diff_total_prior_fights", "diff_finish_rate", "diff_times_finished_rate")]
+    # An arbitrary strict subset of the current columns stands in for "what an
+    # older, already-trained model's saved feature list looked like" -- the
+    # point is the mechanism (use the passed-in list, not model.FEATURE_COLUMNS),
+    # not any specific column names, so this must not depend on what's
+    # currently in/out of the module constant.
+    old_feature_columns = model.FEATURE_COLUMNS[:-1]
     assert len(old_feature_columns) < len(model.FEATURE_COLUMNS)  # sanity: the fixture actually differs
 
     fake_model = _FakeModel(prob_fighter_1_win=0.6)

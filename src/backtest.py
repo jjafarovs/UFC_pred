@@ -33,6 +33,8 @@ def walk_forward_predictions(
     min_train_size: int = 100,
     fold_size: int = 20,
     calib_frac: float = 0.2,
+    model_kwargs: dict | None = None,
+    feature_columns: list[str] | None = None,
 ) -> pd.DataFrame:
     """Expanding-window walk-forward: for each fold of `fold_size` fights (in
     event_date order), trains + calibrates on ALL fights strictly before that
@@ -45,8 +47,18 @@ def walk_forward_predictions(
     if the calibration slice ends up single-class (can happen on tiny
     windows) -- in that case the fold falls back to the base model's raw,
     uncalibrated probabilities rather than failing the whole run.
+
+    `model_kwargs` (e.g. `{"C": 0.3}` for logistic, `{"max_depth": 3,
+    "l2_regularization": 1.0}` for gbm) is applied identically to every
+    fold's freshly-retrained model -- hyperparameters are tuned once, up
+    front, on data strictly before this backtest's window (see the
+    tuning script referenced in the README), not re-tuned per fold, which
+    would be far more expensive and isn't what "walk-forward" is meant to
+    validate here. `feature_columns` defaults to model.FEATURE_COLUMNS if
+    not given, same as make_xy.
     """
     df = df.sort_values("event_date").reset_index(drop=True)
+    model_kwargs = model_kwargs or {}
     predictions = []
 
     for fold_start in range(min_train_size, len(df), fold_size):
@@ -65,13 +77,18 @@ def walk_forward_predictions(
             "walk-forward invariant violated: training window reached into the fold being predicted"
         )
 
-        X_train, y_train = model.make_xy(train_df)
-        X_fold, _ = model.make_xy(fold_df)
+        xy_kwargs = {"feature_columns": feature_columns} if feature_columns is not None else {}
+        X_train, y_train = model.make_xy(train_df, **xy_kwargs)
+        X_fold, _ = model.make_xy(fold_df, **xy_kwargs)
 
-        base = model.build_logistic_pipeline() if model_type == "logistic" else model.build_gradient_boosting_model()
+        base = (
+            model.build_logistic_pipeline(**model_kwargs)
+            if model_type == "logistic"
+            else model.build_gradient_boosting_model(**model_kwargs)
+        )
         base.fit(X_train, y_train)
 
-        X_calib, y_calib = model.make_xy(calib_df)
+        X_calib, y_calib = model.make_xy(calib_df, **xy_kwargs)
         if y_calib.nunique() < 2:
             proba = base.predict_proba(X_fold)[:, 1]
         else:

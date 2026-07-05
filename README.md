@@ -470,6 +470,76 @@ model built this way is not competing with the market from scratch anymore
 — it's testing whether anything beats an already-informed baseline, a
 harder and more honest bar.
 
+### Hyperparameter tuning + Tier 1-3 feature search
+
+Given the "our current features are net anti-predictive" conclusion above,
+ran a systematic, incremental search for improvement: walk-forward-safe
+hyperparameter tuning first, then three tiers of candidate features, each
+tested against the established discipline (walk-forward backtest +
+bootstrap ROI CI + favorite/underdog calibration gap), keeping only what
+actually validates.
+
+**Hyperparameter tuning.** Searched logistic `C` and GBM
+`max_depth`/`learning_rate`/`l2_regularization`/`min_samples_leaf` via
+`TimeSeriesSplit(n_splits=5)` cross-validation strictly on the portion of
+data that becomes the backtest's training set (never touching the actual
+backtest evaluation window), scored on log loss. Logistic barely moved with
+`C` (0.6972-0.6979 across the whole sweep) — it was never the problem.
+GBM moved a lot (0.684 best to 0.717 worst); every default-like config
+(deeper trees, higher learning rate) landed among the worst, confirming GBM
+was overfitting on this modest tabular dataset.
+
+Re-running the *real* backtest with the log-loss-optimal picks gave a mixed
+result: logistic's tuned `C=0.01` was a clean win (ROI CI flipped from a
+*proven significant loss* `[-19.2%, -0.3%]` to *not significant*
+`[-18.1%, +0.3%]`, with accuracy/brier essentially unchanged). GBM's
+log-loss-optimal pick (`l2=0.0, leaf=20`) made accuracy/brier/calibration
+slightly *better* but flipped its ROI CI the wrong way, from not-significant
+to a proven loss — log loss on a held-out slice is a decent starting point,
+not a substitute for checking the real backtest. Checking a few more
+regularized neighbors directly against the real backtest found
+`max_depth=3, learning_rate=0.03, l2_regularization=1.0, min_samples_leaf=50`
+strictly better than sklearn's defaults on every axis: ROI -7.3% → -4.6%,
+CI `[-17.1%, +2.5%]` → `[-14.3%, +5.3%]` (tighter and higher), calibration
+gap 0.084 → 0.079. Both are now `model.py`'s validated defaults.
+
+**Tier 1 features** (control-time share, split-decision rate, title-fight
+flag + scheduled rounds, cross-book odds divergence): only rolling-window
+**grappling control-time share** (`diff_control_time_pct`,
+`fighter_rolling_features`' `control_time_pct`, 97.9% coverage from
+`fight_stats.control_time_sec`) validated — it improved ROI and tightened
+the bootstrap CI for *both* logistic (`[-18.1%,+0.3%]` → `[-16.7%,+2.7%]`)
+and GBM (`[-14.3%,+5.3%]` → `[-13.7%,+6.8%]`) without regressing
+accuracy/brier/calibration. `scheduled_rounds` in particular flipped
+logistic's backtest into a proven significant loss (`[-22.9%,-4.9%]`) on
+its own and was rejected outright; the other two were neutral-to-mixed
+(helped one model, hurt the other) and were rejected under the same "keep
+only what validates for both models" bar used throughout this project.
+
+**Tier 2 features** (KO-vs-submission share of career finishes, a
+southpaw/orthodox directional stance-matchup indicator, and a 3-fights-vs-
+prior-3-fights form-trend delta): none validated. Individually and combined,
+every result landed inside the overlapping-CI noise band relative to the
+Tier 1 baseline (e.g. logistic `[-16.7%,+2.7%]` vs. combined-Tier2
+`[-15.8%,+3.2%]` — heavily overlapping, not distinguishable), unlike Tier
+1's control-time feature, which showed a decisive, non-overlapping shift on
+both models. All three were reverted.
+
+**Tier 3 feature** (fraction of a fighter's career fights that reached
+round 3+, a durability/cardio proxy): clearly regressed logistic (ROI
+-7.2% → -9.0%, CI `[-16.7%,+2.7%]` → `[-18.8%,+0.6%]`) while doing nothing
+for GBM. Rejected and reverted.
+
+**Net result of this pass**: tuned hyperparameters (both models) +
+`diff_control_time_pct` (Tier 1) are the only changes that survived
+validation and are now in production. Final validated backtest: logistic
+accuracy 68.2%, ROI -7.2%, CI `[-16.7%, +2.7%]` (not significant); GBM
+accuracy 66.4%, ROI -3.7%, CI `[-13.7%, +6.8%]` (not significant) — a real,
+if modest, improvement over the prior significant-loss result, but still
+not a validated positive edge. The search continues to point the same
+direction as before: incremental box-score-style features are close to
+exhausted as a source of new signal against this market.
+
 ## Reporting
 
 `src/report.py` takes a list of upcoming matchups (fighter ID pairs) and
