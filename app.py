@@ -24,7 +24,7 @@ from datetime import date, datetime
 import pandas as pd
 import streamlit as st
 
-from src import features, market, report
+from src import features, market, report, strategy
 
 DB_PATH = "db/ufc.db"
 
@@ -90,10 +90,26 @@ st.warning(
     icon="⚠️",
 )
 
-model_name = st.sidebar.radio("Model", ["logistic", "gbm"], index=0)
+model_name = st.sidebar.radio("Model (used for the Confidence label)", ["logistic", "gbm"], index=0)
 n_window = st.sidebar.slider("Rolling form window (last N fights)", min_value=3, max_value=10, value=5)
-fitted_model, model_path, calibration_table, feature_columns = get_model(model_name)
-st.sidebar.caption(f"Model artifact: `{model_path.name}`")
+logistic_model, logistic_path, logistic_calib, logistic_features = get_model("logistic")
+gbm_model, gbm_path, gbm_calib, gbm_features = get_model("gbm")
+st.sidebar.caption(f"Logistic artifact: `{logistic_path.name}`  \nGBM artifact: `{gbm_path.name}`")
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Betting strategy highlight")
+show_original = st.sidebar.checkbox("Highlight Original rule", value=True)
+show_tighter = st.sidebar.checkbox("Highlight Tighter rule", value=True)
+st.sidebar.caption(
+    "Both rules need the average of the logistic + GBM probabilities past a "
+    "threshold, AND neither model individually below/above a confirm floor. "
+    "**Original** (avg>62%/<38%, confirm>=55%/<=45%): backtested ROI +4.4%, "
+    "95% CI [-0.9%,+9.7%] -- consistently positive, not yet statistically proven. "
+    "**Tighter** (avg>75%/<25%, same confirm floor): backtested ROI +7.3%, "
+    "95% CI [+1.0%,+13.3%] -- the first strategy tested on this project with a "
+    "CI that excludes zero, though still based on one ~2-year backtest. "
+    "See README's Walk-forward backtest section for the full methodology."
+)
 
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -144,25 +160,92 @@ fights_df = pd.read_sql_query(
 
 matchups = list(zip(fights_df["fighter_1_id"], fights_df["fighter_2_id"]))
 as_of = selected_event["event_date"] if selected_event["event_date"] <= date.today().isoformat() else date.today().isoformat()
-card_report = report.build_card_report(
-    conn, fitted_model, matchups, as_of_date=as_of, odds_type="live", n=n_window,
-    calibration_table=calibration_table, feature_columns=feature_columns,
+
+# Both models are always computed -- the betting-strategy signals need both
+# probabilities together (average + individual confirm floors), regardless
+# of which single model's Confidence label the sidebar radio selects.
+logistic_report = report.build_card_report(
+    conn, logistic_model, matchups, as_of_date=as_of, odds_type="live", n=n_window,
+    calibration_table=logistic_calib, feature_columns=logistic_features,
 )
+gbm_report = report.build_card_report(
+    conn, gbm_model, matchups, as_of_date=as_of, odds_type="live", n=n_window,
+    calibration_table=gbm_calib, feature_columns=gbm_features,
+)
+
+card_report = logistic_report.copy()
+card_report["logistic_prob"] = logistic_report["model_prob_fighter_1"]
+card_report["gbm_prob"] = gbm_report["model_prob_fighter_1"]
+card_report["avg_prob"] = (card_report["logistic_prob"] + card_report["gbm_prob"]) / 2
+card_report["edge_fighter_1"] = card_report["avg_prob"] - card_report["market_prob_fighter_1"]
+card_report["confidence"] = logistic_report["confidence"] if model_name == "logistic" else gbm_report["confidence"]
 card_report["weight_class"] = fights_df["weight_class"]
 card_report["title_fight"] = fights_df["title_fight"].astype(bool)
 
+card_report["original_signal"] = [
+    strategy.bet_signal(lp, gp, **strategy.ORIGINAL_RULE) if show_original else None
+    for lp, gp in zip(card_report["logistic_prob"], card_report["gbm_prob"])
+]
+card_report["tighter_signal"] = [
+    strategy.bet_signal(lp, gp, **strategy.TIGHTER_RULE) if show_tighter else None
+    for lp, gp in zip(card_report["logistic_prob"], card_report["gbm_prob"])
+]
+
+
+def _signal_label(row) -> str:
+    original, tighter = row["original_signal"], row["tighter_signal"]
+    fighter = tighter or original
+    if fighter is None:
+        return ""
+    fighter_name = row["fighter_1"] if fighter == "fighter_1" else row["fighter_2"]
+    if original is not None and tighter is not None:
+        return f"\U0001F525 Both rules -> {fighter_name}"
+    if tighter is not None:
+        return f"⭐ Tighter rule -> {fighter_name}"
+    return f"✅ Original rule -> {fighter_name}"
+
+
+card_report["Strategy Signal"] = card_report.apply(_signal_label, axis=1)
+
 display_df = card_report.copy()
-display_df["Model %"] = display_df["model_prob_fighter_1"].map(_fmt_pct)
+display_df["Logistic %"] = display_df["logistic_prob"].map(_fmt_pct)
+display_df["GBM %"] = display_df["gbm_prob"].map(_fmt_pct)
+display_df["Avg %"] = display_df["avg_prob"].map(_fmt_pct)
 display_df["Market %"] = display_df["market_prob_fighter_1"].map(_fmt_pct)
 display_df["Edge"] = display_df["edge_fighter_1"].map(_fmt_edge)
 display_df = display_df.rename(
     columns={"fighter_1": "Fighter 1", "fighter_2": "Fighter 2", "weight_class": "Weight class", "confidence": "Confidence"}
 )
+
+table_cols = ["Fighter 1", "Fighter 2", "Weight class", "Logistic %", "GBM %", "Avg %", "Market %", "Edge", "Confidence", "Strategy Signal"]
+
+
+def _highlight_row(row):
+    label = row["Strategy Signal"]
+    if label.startswith("\U0001F525"):
+        color = "background-color: rgba(255, 99, 71, 0.35)"  # both rules -- strongest highlight
+    elif label.startswith("⭐"):
+        color = "background-color: rgba(255, 215, 0, 0.30)"  # tighter rule only
+    elif label.startswith("✅"):
+        color = "background-color: rgba(60, 179, 113, 0.25)"  # original rule only
+    else:
+        color = ""
+    return [color] * len(row)
+
+
 st.dataframe(
-    display_df[["Fighter 1", "Fighter 2", "Weight class", "Model %", "Market %", "Edge", "Confidence"]],
+    display_df[table_cols].style.apply(_highlight_row, axis=1),
     use_container_width=True,
     hide_index=True,
+    height=min(35 * (len(display_df) + 1) + 3, 740),
+    column_config={"Strategy Signal": st.column_config.TextColumn(width="medium")},
 )
+if show_original or show_tighter:
+    st.caption(
+        "Highlighted rows are the fights the selected strategy/strategies flag as bettable -- "
+        "everything else gets no bet under either rule. \U0001F525 = both rules agree, "
+        "⭐ = tighter rule only, ✅ = original rule only."
+    )
 
 st.subheader("Fight detail")
 fight_choice = st.selectbox(
@@ -172,6 +255,15 @@ fight_choice = st.selectbox(
 )
 row = fights_df.iloc[fight_choice]
 report_row = card_report.iloc[fight_choice]
+
+status = report_row["Strategy Signal"] or "No signal from either rule -- not bettable under either strategy."
+st.markdown(
+    f"**Logistic:** {_fmt_pct(report_row['logistic_prob'])} &nbsp;|&nbsp; "
+    f"**GBM:** {_fmt_pct(report_row['gbm_prob'])} &nbsp;|&nbsp; "
+    f"**Avg:** {_fmt_pct(report_row['avg_prob'])} &nbsp;|&nbsp; "
+    f"**Market:** {_fmt_pct(report_row['market_prob_fighter_1'])} &nbsp;|&nbsp; "
+    f"**Strategy:** {status}"
+)
 
 f1_roll = features.fighter_rolling_features(conn, row["fighter_1_id"], as_of, n=n_window)
 f2_roll = features.fighter_rolling_features(conn, row["fighter_2_id"], as_of, n=n_window)
