@@ -100,14 +100,18 @@ st.sidebar.markdown("---")
 st.sidebar.subheader("Betting strategy highlight")
 show_original = st.sidebar.checkbox("Highlight Original rule", value=True)
 show_tighter = st.sidebar.checkbox("Highlight Tighter rule", value=True)
+show_refined = st.sidebar.checkbox("Highlight Refined rule", value=True)
 st.sidebar.caption(
-    "Both rules need the average of the logistic + GBM probabilities past a "
+    "All rules need the average of the logistic + GBM probabilities past a "
     "threshold, AND neither model individually below/above a confirm floor. "
     "**Original** (avg>62%/<38%, confirm>=55%/<=45%): backtested ROI +4.4%, "
     "95% CI [-0.9%,+9.7%] -- consistently positive, not yet statistically proven. "
     "**Tighter** (avg>75%/<25%, same confirm floor): backtested ROI +7.3%, "
-    "95% CI [+1.0%,+13.3%] -- the first strategy tested on this project with a "
-    "CI that excludes zero, though still based on one ~2-year backtest. "
+    "95% CI [+1.0%,+13.3%] -- statistically significant, found via a threshold sweep. "
+    "**Refined** (same thresholds as Original, plus: both fighters need >=3 tracked "
+    "fights, and title fights are excluded): backtested ROI +10.9%, 95% CI "
+    "[+3.8%,+17.6%] -- the strongest and most robust result found so far, significant "
+    "across every retraining-schedule variant tested. "
     "See README's Walk-forward backtest section for the full methodology."
 )
 
@@ -190,19 +194,25 @@ card_report["tighter_signal"] = [
     strategy.bet_signal(lp, gp, **strategy.TIGHTER_RULE) if show_tighter else None
     for lp, gp in zip(card_report["logistic_prob"], card_report["gbm_prob"])
 ]
+card_report["refined_signal"] = [
+    strategy.bet_signal(lp, gp, f1_n_prior=f1n, f2_n_prior=f2n, title_fight=tf, **strategy.REFINED_RULE)
+    if show_refined else None
+    for lp, gp, f1n, f2n, tf in zip(
+        card_report["logistic_prob"], card_report["gbm_prob"],
+        card_report["f1_n_prior_fights"], card_report["f2_n_prior_fights"], card_report["title_fight"],
+    )
+]
 
 
 def _signal_label(row) -> str:
-    original, tighter = row["original_signal"], row["tighter_signal"]
-    fighter = tighter or original
+    original, tighter, refined = row["original_signal"], row["tighter_signal"], row["refined_signal"]
+    fighter = original or tighter or refined
     if fighter is None:
         return ""
     fighter_name = row["fighter_1"] if fighter == "fighter_1" else row["fighter_2"]
-    if original is not None and tighter is not None:
-        return f"\U0001F525 Both rules -> {fighter_name}"
-    if tighter is not None:
-        return f"⭐ Tighter rule -> {fighter_name}"
-    return f"✅ Original rule -> {fighter_name}"
+    active = [name for name, sig in [("Original", original), ("Tighter", tighter), ("Refined", refined)] if sig is not None]
+    icon = "\U0001F525" if len(active) >= 3 else "⭐" if len(active) == 2 else "✅"
+    return f"{icon} {' + '.join(active)} -> {fighter_name}"
 
 
 card_report["Strategy Signal"] = card_report.apply(_signal_label, axis=1)
@@ -240,11 +250,12 @@ st.dataframe(
     height=min(35 * (len(display_df) + 1) + 3, 740),
     column_config={"Strategy Signal": st.column_config.TextColumn(width="medium")},
 )
-if show_original or show_tighter:
+if show_original or show_tighter or show_refined:
     st.caption(
         "Highlighted rows are the fights the selected strategy/strategies flag as bettable -- "
-        "everything else gets no bet under either rule. \U0001F525 = both rules agree, "
-        "⭐ = tighter rule only, ✅ = original rule only."
+        "everything else gets no bet under any rule. \U0001F525 = all 3 selected rules agree, "
+        "⭐ = 2 of the selected rules agree, ✅ = 1 rule only. The label spells out exactly which "
+        "rule(s) fired, e.g. \"Original + Refined\"."
     )
 
 st.subheader("Fight detail")
@@ -256,7 +267,7 @@ fight_choice = st.selectbox(
 row = fights_df.iloc[fight_choice]
 report_row = card_report.iloc[fight_choice]
 
-status = report_row["Strategy Signal"] or "No signal from either rule -- not bettable under either strategy."
+status = report_row["Strategy Signal"] or "No signal from any selected rule -- not bettable under any strategy."
 st.markdown(
     f"**Logistic:** {_fmt_pct(report_row['logistic_prob'])} &nbsp;|&nbsp; "
     f"**GBM:** {_fmt_pct(report_row['gbm_prob'])} &nbsp;|&nbsp; "

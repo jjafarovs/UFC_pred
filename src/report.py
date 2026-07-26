@@ -201,6 +201,11 @@ def build_card_report(
                 "confidence": _confidence_label(
                     feat["f1_n_prior_fights"], feat["f2_n_prior_fights"], model_prob, calibration_table
                 ),
+                # Exposed for strategy.bet_signal's REFINED_RULE (min_n_prior
+                # filter) -- not just an internal detail of the confidence
+                # label anymore, so it needs to be a real column here.
+                "f1_n_prior_fights": feat["f1_n_prior_fights"],
+                "f2_n_prior_fights": feat["f2_n_prior_fights"],
             }
         )
     return pd.DataFrame(rows)
