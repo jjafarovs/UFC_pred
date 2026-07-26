@@ -261,6 +261,41 @@ Model artifacts (`.joblib`) and their metrics (`.json`) are timestamp-versioned
 under `models/` — a backtest result should always be traceable to the exact
 artifact that produced it.
 
+**The same failure mode recurred later, with a different feature.** After
+`market_prob_fighter_1` was added (see Walk-forward backtest below), every
+production model artifact built via this file's default 60/20/20 split was
+silently ignoring it. Real odds coverage only exists for roughly the last 5
+years within this project's full 32-year (1994-2026) history -- `train_df`
+(the first 60% of *all* history, ending 2019-08-03) predates that window
+entirely, so `market_prob_fighter_1` was 100% missing at fit time. Exactly
+like the earlier rolling-form case above: `SimpleImputer` silently drops an
+all-missing column rather than imputing it, and (less obviously)
+`HistGradientBoostingClassifier` never finds a useful split on a column with
+zero real variance either, so GBM was equally affected despite handling NaN
+natively in general. Verified concretely, not just inferred: feeding the
+same fitted production models `market_prob_fighter_1 = 0.1` vs. `0.9` for an
+otherwise-identical fight produced byte-identical predictions in both
+models. This did **not** affect any backtest number reported in this
+README -- `backtest.py`'s walk-forward folds use `min_train_size=7500`
+(well past where coverage begins, row ~6061), so every validated finding
+throughout this project was computed correctly. It only affected the
+separate artifacts in `models/production.json` that the live dashboard
+actually serves, meaning real dashboard predictions had been silently
+missing the single most impactful, validated feature this project has
+found since it was introduced.
+
+**Fix**: `chronological_split` now takes an optional `min_train_size` floor,
+applied after the fractional split (`test_frac`/`calib_frac` then still
+divide whatever remains) -- `main()`'s CLI defaults it to 7500, matching
+`backtest.py`'s own already-proven convention, so `python3 -m src.model` now
+structurally can't reproduce this. Both production models were retrained
+and re-verified to actually respond to `market_prob_fighter_1` before being
+re-promoted. Two regression tests
+(`test_chronological_split_min_train_size_is_a_floor_not_a_target`,
+`test_chronological_split_min_train_size_prevents_an_all_missing_training_column`)
+pin this specifically, the latter reproducing the exact "coverage clustered
+in the tail" shape that caused it.
+
 ## Market de-vigging + edge
 
 `src/market.py` converts American or decimal odds to implied probability,
@@ -709,6 +744,29 @@ column list out of the model artifact's own saved metadata (already stored
 there by `save_model_artifact`) and threading it through explicitly, so a
 pinned older model keeps working correctly no matter how many new features
 get added to the code later.
+
+**Betting-strategy highlighting** (`src/strategy.py`): the sidebar's
+Original/Tighter/Refined checkboxes highlight whichever fights each
+model-confidence rule flags as bettable, with the exact rule(s) spelled out
+per row (e.g. "Original + Refined") rather than a generic tier -- see that
+module's docstring for the full backtest numbers behind each rule.
+
+**Two more bugs caught by actually running the app** (terminal noise the
+user reported was real, not cosmetic, in one case): (1) the fight-detail
+comparison table mixed raw ints/floats/`None` with `_pct()`'s `"60%"`
+strings in the same column, which pandas stores as an `object`-dtype column
+-- Streamlit's Arrow serialization couldn't convert it
+(`ArrowInvalid: Could not convert '60%' ... to int64`) and silently
+recovered with its own type-coercion fallback, but the underlying crash was
+real. Fixed by routing every cell through a string-producing helper so no
+column ever mixes types. (2) `use_container_width` is deprecated in the
+installed Streamlit version (1.50) -- replaced with `width="stretch"`
+everywhere it was used. The `SimpleImputer` "Skipping features without any
+observed values" warning that also showed up in the terminal was a *symptom*
+of the `market_prob_fighter_1` training bug documented in Model +
+calibration above, not a separate issue -- it disappeared on its own once
+that bug was fixed at the root, confirming it wasn't a case that needed
+suppressing.
 
 ## Setup
 

@@ -245,7 +245,7 @@ def _highlight_row(row):
 
 st.dataframe(
     display_df[table_cols].style.apply(_highlight_row, axis=1),
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
     height=min(35 * (len(display_df) + 1) + 3, 740),
     column_config={"Strategy Signal": st.column_config.TextColumn(width="medium")},
@@ -292,25 +292,34 @@ def _num(x, fmt="{:.0f}"):
     return "-" if x is None else fmt.format(x)
 
 
+def _raw(x):
+    # Every cell in comparison_df must be a string -- mixing raw ints/floats/None
+    # with _pct()'s "60%" strings in the same column made pandas produce an
+    # object-dtype column pyarrow couldn't serialize (ArrowInvalid: "Could not
+    # convert '60%' ... to int64"). Streamlit silently recovers by coercing
+    # columns itself, but the underlying crash is real -- this avoids it.
+    return "-" if x is None else str(x)
+
+
 comparison_rows = [
-    ("Fights tracked (last N)", f1_roll["n_prior_fights"], f2_roll["n_prior_fights"]),
-    ("Career fights (all-time)", f1_career["total_prior_fights"], f2_career["total_prior_fights"]),
+    ("Fights tracked (last N)", _raw(f1_roll["n_prior_fights"]), _raw(f2_roll["n_prior_fights"])),
+    ("Career fights (all-time)", _raw(f1_career["total_prior_fights"]), _raw(f2_career["total_prior_fights"])),
     ("Win % (last N)", _pct(f1_roll["win_pct"]), _pct(f2_roll["win_pct"])),
-    ("Current streak", f1_roll["current_streak"], f2_roll["current_streak"]),
+    ("Current streak", _raw(f1_roll["current_streak"]), _raw(f2_roll["current_streak"])),
     ("Finish rate (career wins by KO/sub)", _pct(f1_career["finish_rate"]), _pct(f2_career["finish_rate"])),
     ("Times finished (career losses by KO/sub)", _pct(f1_career["times_finished_rate"]), _pct(f2_career["times_finished_rate"])),
     ("Sig. strike accuracy", _pct(f1_roll["sig_str_acc"]), _pct(f2_roll["sig_str_acc"])),
     ("Sig. strike defense", _pct(f1_roll["sig_str_def"]), _pct(f2_roll["sig_str_def"])),
     ("Takedown accuracy", _pct(f1_roll["td_acc"]), _pct(f2_roll["td_acc"])),
     ("Takedown defense", _pct(f1_roll["td_def"]), _pct(f2_roll["td_def"])),
-    ("Days since last fight", f1_roll["days_since_last_fight"], f2_roll["days_since_last_fight"]),
-    ("Height (in)", f1_phys["height_in"], f2_phys["height_in"]),
-    ("Reach (in)", f1_phys["reach_in"], f2_phys["reach_in"]),
-    ("Stance", f1_phys["stance"], f2_phys["stance"]),
+    ("Days since last fight", _raw(f1_roll["days_since_last_fight"]), _raw(f2_roll["days_since_last_fight"])),
+    ("Height (in)", _raw(f1_phys["height_in"]), _raw(f2_phys["height_in"])),
+    ("Reach (in)", _raw(f1_phys["reach_in"]), _raw(f2_phys["reach_in"])),
+    ("Stance", f1_phys["stance"] or "-", f2_phys["stance"] or "-"),
     ("Age (as of fight)", _num(f1_phys["age_years"], "{:.1f}"), _num(f2_phys["age_years"], "{:.1f}")),
 ]
 comparison_df = pd.DataFrame(comparison_rows, columns=["Stat", row["fighter_1_name"], row["fighter_2_name"]])
-st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+st.dataframe(comparison_df, width="stretch", hide_index=True)
 st.caption(
     "Numbers only, no highlighting of \"better\"/\"worse\" -- several of these "
     "(e.g. days since last fight, times finished) don't have a universally correct "

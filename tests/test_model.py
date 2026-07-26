@@ -61,6 +61,44 @@ def test_chronological_split_raises_on_too_few_rows():
         model.chronological_split(df, calib_frac=0.2, test_frac=0.2)
 
 
+def test_chronological_split_min_train_size_is_a_floor_not_a_target():
+    df = _make_matrix(100)
+    # Without min_train_size, default fractions give train=60.
+    train_df, _, _ = model.chronological_split(df, calib_frac=0.2, test_frac=0.2)
+    assert len(train_df) == 60
+    # A floor below the natural size changes nothing.
+    train_df, _, _ = model.chronological_split(df, calib_frac=0.2, test_frac=0.2, min_train_size=10)
+    assert len(train_df) == 60
+    # A floor above the natural size raises it, shrinking calib/test instead.
+    train_df, calib_df, test_df = model.chronological_split(df, calib_frac=0.2, test_frac=0.2, min_train_size=90)
+    assert len(train_df) == 90
+    assert len(calib_df) + len(test_df) == 10
+    assert len(calib_df) > 0 and len(test_df) > 0
+
+
+def test_chronological_split_min_train_size_prevents_an_all_missing_training_column():
+    """Regression test for a real bug: market_prob_fighter_1's real coverage
+    is clustered in the most recent ~5 years of a 32-year history, so the
+    default 60/20/20 fractional split put ALL of it in calib/test and left
+    train_df with zero non-null values -- silently making every production
+    model artifact ignore the feature entirely (SimpleImputer drops an
+    all-NaN column; HistGradientBoostingClassifier never splits on one).
+    Mimics that shape: coverage only in the last 10% of rows, positionally.
+    """
+    df = _make_matrix(200, seed=7)
+    df = df.sort_values("event_date").reset_index(drop=True)
+    df["market_prob_fighter_1"] = np.nan
+    df.loc[df.index[-20:], "market_prob_fighter_1"] = np.linspace(0.3, 0.7, 20)
+
+    # Default fractional split (train = first 60%): zero real coverage reaches training.
+    train_df, _, _ = model.chronological_split(df, calib_frac=0.2, test_frac=0.2)
+    assert train_df["market_prob_fighter_1"].notna().sum() == 0
+
+    # With a high-enough min_train_size, training now reaches into the covered tail.
+    train_df, calib_df, _ = model.chronological_split(df, calib_frac=0.2, test_frac=0.2, min_train_size=190)
+    assert train_df["market_prob_fighter_1"].notna().sum() > 0
+
+
 def test_logistic_pipeline_and_calibration_produce_valid_probabilities():
     df = _make_matrix(200, seed=2)
     train_df, calib_df, test_df = model.chronological_split(df)

@@ -79,22 +79,48 @@ def load_feature_matrix(path: Path = FEATURE_MATRIX_PATH) -> pd.DataFrame:
     return df
 
 
-def chronological_split(df: pd.DataFrame, calib_frac: float = 0.2, test_frac: float = 0.2):
+def chronological_split(df: pd.DataFrame, calib_frac: float = 0.2, test_frac: float = 0.2, min_train_size: int | None = None):
     """Sorts by event_date and splits train/calibration/test in time order --
     never randomly. A random split would place an earlier fight in the test
     set and a later one in train; that's a leak in spirit even though each
     row's own features are already as-of-date safe, because it lets the model
     "see" market/meta conditions from later in time during training.
+
+    `min_train_size` is a floor on the train slice, applied AFTER the
+    fractional split -- added after discovering a real bug: on the full
+    32-year history, a naive 60/20/20 fractional split puts `train_df`
+    entirely before 2019, and `market_prob_fighter_1` coverage (odds only
+    exist for roughly the last 5 years) doesn't start until 2021. That meant
+    every production model artifact built via this function's default
+    fractions had ZERO real examples of that column during fit --
+    SimpleImputer silently drops an all-NaN column entirely (logistic), and
+    HistGradientBoostingClassifier never finds a split on an all-missing
+    column (GBM) -- so the single most-validated feature in this project
+    was silently inert in every deployed dashboard prediction, verified by
+    feeding the same fitted model market_prob_fighter_1=0.1 vs 0.9 and
+    getting byte-identical output. `main()`'s CLI now defaults
+    `min_train_size` to 7500, matching backtest.py's own established,
+    already-validated convention (walk-forward folds only ever start at row
+    7500+, which is already past where odds coverage begins at row ~6061 --
+    that's why the walk-forward backtest numbers throughout this project's
+    history were never affected by this bug, only the separate
+    production-artifact-building path here was).
     """
     df = df.sort_values("event_date").reset_index(drop=True)
     n = len(df)
     n_test = int(n * test_frac)
     n_calib = int(n * calib_frac)
     n_train = n - n_test - n_calib
+    if min_train_size is not None and n_train < min_train_size:
+        n_train = min_train_size
+        remaining = n - n_train
+        calib_share = calib_frac / (calib_frac + test_frac) if (calib_frac + test_frac) > 0 else 0.5
+        n_calib = max(int(remaining * calib_share), 1)
+        n_test = remaining - n_calib
     if n_train <= 0 or n_calib <= 0 or n_test <= 0:
         raise ValueError(
             f"Not enough rows ({n}) to split into non-empty train/calibration/test sets "
-            f"with calib_frac={calib_frac}, test_frac={test_frac}"
+            f"with calib_frac={calib_frac}, test_frac={test_frac}, min_train_size={min_train_size}"
         )
     return df.iloc[:n_train], df.iloc[n_train : n_train + n_calib], df.iloc[n_train + n_calib :]
 
@@ -263,10 +289,14 @@ def main() -> None:
     parser.add_argument("--calibration", choices=["isotonic", "sigmoid"], default="sigmoid")
     parser.add_argument("--calib-frac", type=float, default=0.2)
     parser.add_argument("--test-frac", type=float, default=0.2)
+    parser.add_argument(
+        "--min-train-size", type=int, default=7500,
+        help="Floor on the train slice so it reaches into the odds-covered era -- see chronological_split's docstring.",
+    )
     args = parser.parse_args()
 
     df = load_feature_matrix(args.features)
-    train_df, calib_df, test_df = chronological_split(df, args.calib_frac, args.test_frac)
+    train_df, calib_df, test_df = chronological_split(df, args.calib_frac, args.test_frac, min_train_size=args.min_train_size)
     print(f"train/calibration/test sizes: {len(train_df)}/{len(calib_df)}/{len(test_df)}")
 
     X_train, y_train = make_xy(train_df)
