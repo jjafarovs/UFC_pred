@@ -142,3 +142,29 @@ def test_fetch_upcoming_card_returns_scheduled_fights_and_fighter_ids():
     assert all(f["event_id"] == "fccb0fee256b7b4d" for f in card["fights"])
     assert "f4c49976c75c5ab2" in card["fighter_ids"]  # McGregor
     assert "150ff4cc642270b9" in card["fighter_ids"]  # Holloway
+
+
+def test_merge_by_key_keeps_existing_entries_not_present_in_new_fetch():
+    """Regression test: a bounded/incremental fetch (e.g. the 40 most recent
+    bestfightodds events) must never be treated as the complete dataset --
+    in practice, dumping its result directly wiped a 5-year, 2,164-fight
+    odds backfill down to ~20 events, because the old, wider fetch's data
+    lived only in this same file.
+    """
+    existing = [{"slug": "/events/old-1", "name": "Old Event 1"}, {"slug": "/events/old-2", "name": "Old Event 2"}]
+    new = [{"slug": "/events/new-1", "name": "New Event 1"}]
+
+    merged = fetcher._merge_by_key(existing, new, key="slug")
+
+    slugs = {item["slug"] for item in merged}
+    assert slugs == {"/events/old-1", "/events/old-2", "/events/new-1"}
+
+
+def test_merge_by_key_refreshes_a_re_fetched_entry_rather_than_duplicating_it():
+    existing = [{"slug": "/events/e1", "name": "Stale Name"}]
+    new = [{"slug": "/events/e1", "name": "Fresh Name"}]
+
+    merged = fetcher._merge_by_key(existing, new, key="slug")
+
+    assert len(merged) == 1
+    assert merged[0]["name"] == "Fresh Name"

@@ -7,40 +7,38 @@ model is much more confident than the other doesn't qualify just because
 the average alone clears the bar.
 
 Validated via a real walk-forward backtest (min_train_size=7500,
-fold_size=200, 2024-05-04 to 2026-06-27, 95% bootstrap CI on ROI) before
-being wired into the dashboard -- see README's Walk-forward backtest
-section for the full methodology and numbers:
+fold_size=200, 95% bootstrap CI on ROI) before being wired into the
+dashboard -- see README's Walk-forward backtest section for the full
+methodology and numbers. Numbers below are from the post-recovery re-run
+(2024-05-04 to 2026-07-25, 1,126 fights, 1,005 with matched closing odds)
+after a 5-year odds-backfill wipe (see README/model.py: a routine
+`refresh_full` run destroyed 2,164 matched fights down to 21) was fixed and
+fully restored to 2,236 matched fights -- slightly better coverage than
+before the incident:
 
-- ORIGINAL_RULE (avg>62%/<38%, confirm>=55%/<=45%): 565 bets, 75.9% hit
-  rate, ROI +4.4%, CI [-0.9%, +9.7%] -- consistently positive across a
-  fold-size robustness sweep, but the CI still includes zero. Not proven,
-  but a real, stable improvement over the project's earlier edge-threshold
-  approach (which was a proven loss).
-- TIGHTER_RULE (avg>75%/<25%, confirm>=55%/<=45%): 211 bets, 85.8% hit
-  rate, ROI +7.3%, CI [+1.0%, +13.3%] -- the first strategy in this
-  project's history to produce a bootstrap CI that excludes zero. Found via
-  a threshold sweep, so treat with the appropriate multiple-comparisons
-  caution: it held up across a fold-size robustness check (3/5
-  significant, the other 2 barely miss) and sits inside a smooth,
+- ORIGINAL_RULE (avg>62%/<38%, confirm>=55%/<=45%): 625 bets, 77.1% hit
+  rate, ROI +5.9%, CI [+1.2%, +10.7%] -- now SIGNIFICANT for the first time
+  (previously CI [-0.9%,+9.7%] on the smaller/incomplete-coverage dataset).
+- TIGHTER_RULE (avg>75%/<25%, confirm>=55%/<=45%): 237 bets, 86.9% hit
+  rate, ROI +9.3%, CI [+3.5%, +14.7%] -- significant, found via a threshold
+  sweep so treat with the appropriate multiple-comparisons caution: it held
+  up across a fold-size robustness check and sits inside a smooth,
   monotonic hit-rate/threshold trend rather than being an isolated spike,
-  which is what makes it more trustworthy than a typical "found by
-  grid search" result -- but it is still one backtest on ~2 years of data,
-  not a guarantee.
+  which is what makes it more trustworthy than a typical "found by grid
+  search" result -- but it is still one backtest window, not a guarantee.
 - REFINED_RULE (same thresholds as ORIGINAL_RULE, plus: both fighters must
-  have >=3 tracked prior fights, and title fights are excluded): 305 bets,
-  79.3% hit rate, ROI +10.9%, CI [+3.8%, +17.6%]. The strongest result
-  found in this project's history -- significant across EVERY fold-size
-  robustness variant tested (5/5), versus 3/5 for TIGHTER_RULE and 0/5 for
-  ORIGINAL_RULE alone. Two independent, well-motivated observations drive
-  it: (1) fights involving a fighter with very few tracked bouts have
+  have >=3 tracked prior fights, and title fights are excluded): 335 bets,
+  79.4% hit rate, ROI +11.0%, CI [+4.3%, +17.7%]. The strongest result
+  found in this project's history, significant across every fold-size
+  robustness variant tested. Two independent, well-motivated observations
+  drive it: (1) fights involving a fighter with very few tracked bouts have
   inherently noisier rolling-window features (see features.py), and
   restricting to >=3 prior fights removed a real source of bad predictions
   rather than just cutting the sample; (2) title fights specifically
-  performed terribly under ORIGINAL_RULE (26 bets, 57.7% hit rate, ROI
-  -19.9%) while non-title fights alone were already significant on their
-  own (+5.6%, CI [+0.2%,+10.8%]). Same caveat as the others: one ~2-year
-  backtest window (odds coverage doesn't extend further back), not a
-  guarantee of future performance.
+  performed terribly under ORIGINAL_RULE (57.7% hit rate, ROI -19.9% on the
+  original smaller sample) while non-title fights alone were already
+  significant on their own. Same caveat as the others: odds coverage only
+  goes back ~5 years, not a guarantee of future performance.
 """
 from __future__ import annotations
 

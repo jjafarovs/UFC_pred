@@ -146,6 +146,28 @@ hitting the network again.
     pursued the same way — very old fights likely have thin-to-no odds data
     on bestfightodds regardless of effort, and 5 years already gives the
     walk-forward training window real coverage.
+  - **This 5-year backfill was accidentally destroyed once, then fully
+    recovered.** `refresh.py`'s `refresh_full` mode runs `fetcher.py
+    --with-odds`, which calls `fetch_bestfightodds_candidates` — the
+    *bounded, recent-only* mechanism above, not the fighter-profile one that
+    actually built the 5-year backfill. That candidate list was being
+    written to `data/raw/odds_bestfightodds.json` with a plain overwrite
+    (`dump_raw`), not a merge, and `cleaner.match_and_store_odds` does an
+    idempotent delete-then-reinsert against that same file. Running a
+    routine `refresh_full` therefore treated "the ~20 most recent events" as
+    the complete truth and deleted everything else: **2,164 matched fights
+    dropped to 21** in one command. Fixed at the root — `fetcher._merge_by_key`
+    now merges any new fetch into whatever's already on file (keyed on each
+    event's slug) rather than overwriting, with two regression tests pinning
+    this specifically. The lost data was then recovered by re-running the
+    same fighter-profile-based mechanism (341 fighter names seeded from
+    events since 2021-07-10, ~43 minutes at the site's 2-second rate limit),
+    restoring coverage to **2,236 matched fights** — slightly better than
+    before, since the recovery run and the routine refresh's normal fetch
+    both contributed. Both production models were retrained and re-verified
+    to respond to `market_prob_fighter_1` before being re-promoted, and the
+    three betting-strategy backtests (see `src/strategy.py`) were re-run in
+    full on the restored data.
 - Fighter/fight matching across the two sources is name-based (see
   `cleaner.normalize_fighter_name`) plus an event-date tolerance window —
   it's a best-effort join over two independently-formatted sources, not a

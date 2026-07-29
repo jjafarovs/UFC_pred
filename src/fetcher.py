@@ -689,6 +689,21 @@ def _load_existing(name: str) -> list:
     return json.loads(path.read_text()) if path.exists() else []
 
 
+def _merge_by_key(existing: list[dict], new: list[dict], key: str) -> list[dict]:
+    """Merges `new` into `existing`, keyed on `key` -- a freshly re-fetched
+    item overwrites its own prior entry, but nothing already present and not
+    re-fetched this run is ever dropped. Exists specifically so a
+    deliberately bounded/incremental fetch (e.g. "just the 40 most recent
+    events") can never be mistaken for the complete dataset and silently
+    wipe out a wider one-time backfill that used a different mechanism to
+    populate the same file.
+    """
+    merged = {item[key]: item for item in existing}
+    for item in new:
+        merged[item[key]] = item
+    return list(merged.values())
+
+
 def fetch_upcoming_card(client: UFCStatsClient, max_events: int | None = None) -> dict:
     """One-shot pull of every currently scheduled (not-yet-fought) event and
     its fight card: fighter pairs, weight class, date.
@@ -818,8 +833,21 @@ def bootstrap(
     if with_odds:
         odds_client = BestFightOddsClient()
         odds_candidates = fetch_bestfightodds_candidates(odds_client, max_candidates=max_odds_candidates)
-        dump_raw("odds_bestfightodds", odds_candidates)
-        print(f"Fetched {len(odds_candidates)} bestfightodds.com candidate events -> {RAW_DIR}")
+        # MUST merge with whatever's already on file, never overwrite -- this
+        # fetch is deliberately bounded to a small recent window (see
+        # fetch_bestfightodds_candidates' docstring), so treating its result
+        # as the complete truth destroys everything fetched by any other,
+        # wider mechanism (e.g. the fighter-profile-based historical
+        # backfill in fetch_bestfightodds_for_fighters). That's exactly what
+        # happened in practice: a routine refresh wiped a 5-year,
+        # 2,164-fight odds backfill down to ~20 events.
+        existing_candidates = _load_existing("odds_bestfightodds")
+        merged_candidates = _merge_by_key(existing_candidates, odds_candidates, key="slug")
+        dump_raw("odds_bestfightodds", merged_candidates)
+        print(
+            f"Fetched {len(odds_candidates)} recent bestfightodds.com candidate events "
+            f"({len(merged_candidates)} total now on file) -> {RAW_DIR}"
+        )
 
 
 def main() -> None:
