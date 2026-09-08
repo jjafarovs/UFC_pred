@@ -57,6 +57,20 @@ FEATURE_COLUMNS = [
     # logistic's backtest into a proven significant loss -- see README's
     # Walk-forward backtest section.
     "diff_control_time_pct",
+    # Per-round cardio/fade proxy (features.fighter_rolling_features'
+    # fade_rate: ratio of a fighter's own significant-strike output in the
+    # last FULL round of a fight vs their round-1 output, averaged across
+    # their rolling window -- excludes fights that ended in round 1 or 2,
+    # since there's no full "late round" to compare, and always compares
+    # against end_round-1 rather than the actual last round, since a
+    # finish's last round is partial and not a fair comparison to a full
+    # round 1). The only genuinely new DATA SOURCE tried in this project --
+    # every other feature is some ratio of the same round=0 season totals,
+    # which is likely why they mostly failed. This one validated: improved
+    # the best known strategy configuration's ROI/CI in 4 of 5 fold-size
+    # robustness checks, neutral (not worse) in the 5th. See README's
+    # Walk-forward backtest section.
+    "diff_fade_rate",
     # NOTE: diff_total_prior_fights/diff_finish_rate/diff_times_finished_rate
     # (features.fighter_career_features) were tried here and REMOVED --
     # no validated backtest improvement, GBM specifically got worse (full
@@ -65,11 +79,27 @@ FEATURE_COLUMNS = [
     # README's Walk-forward backtest section. Do not re-add without a new
     # walk-forward + bootstrap CI result that actually justifies it.
     # De-vigged closing market probability (see features.market_prob_feature) --
-    # NaN for the ~91% of historical fights with no matched odds.
+    # NaN for most historical fights with no matched odds (~74% currently).
     # HistGradientBoostingClassifier handles this natively; the logistic
     # pipeline's median-imputer treats missing as "no information" via the
     # column median, which is a reasonable neutral fallback for a probability.
     "market_prob_fighter_1",
+    # Career-long Elo win probability (features.elo_prob_feature) -- unlike
+    # every feature above, which windows to a fighter's last N fights, this
+    # tracks a fighter's ENTIRE history, weighted by opponent strength
+    # (beating a good opponent moves the rating more) and finish type (a
+    # KO/submission moves it 1.5x more than a decision). 100% coverage,
+    # unlike market_prob_fighter_1 -- Elo needs no matched odds to exist.
+    # Validated via walk-forward + bootstrap CI: this single addition took
+    # the plain "Refined" betting strategy from CI [-0.0%,+12.6%] (not
+    # distinguishable from noise) to [+3.2%,+15.6%] (significant), and
+    # improved "Refined+" across all 3 fold-size robustness variants tested
+    # (150/200/300: ROI +10.9%/+11.7%/+10.6% vs. without it). Several other
+    # candidates tried alongside it (knockdown rate, submission-attempt
+    # rate, performance volatility, Elo-based strength-of-schedule) added
+    # nothing once this was already in -- deliberately not included. See
+    # strategy.py's ELO_RULE docstring for the full numbers.
+    "elo_prob_fighter_1",
 ]
 
 

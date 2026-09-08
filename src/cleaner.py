@@ -251,6 +251,25 @@ def upsert_fights(conn: sqlite3.Connection, fights: list[dict]) -> tuple[int, in
     return len(fight_rows), len(stat_rows)
 
 
+def remove_completed_fights_from_upcoming(conn: sqlite3.Connection) -> int:
+    """Deletes any `upcoming_fights` row whose fight_id now has a completed
+    record in `fights`. Needed because `--mode full` (refresh.py) fetches
+    completed results but never re-fetches/re-writes the upcoming-card
+    snapshot -- without this, a card that just finished lingers in
+    `upcoming_fights` until the next `--mode upcoming` run happens to
+    wholesale-replace it, and the dashboard's Upcoming tab keeps showing it
+    with a stale LIVE odds line instead of the fight's real, now-available
+    CLOSING line (which the Past Cards tab correctly uses) -- the two tabs
+    showed different numbers for the same fight because of exactly this.
+    Called unconditionally after every upsert_fights, regardless of mode,
+    so this invariant (a fight_id is never "upcoming" once it's completed)
+    can't be violated by which refresh mode ran or in what order.
+    """
+    cur = conn.execute("DELETE FROM upcoming_fights WHERE fight_id IN (SELECT fight_id FROM fights)")
+    conn.commit()
+    return cur.rowcount
+
+
 def _stat_row(fight_id: str, fighter_id: str, round_num: int, s: dict) -> tuple:
     return (
         fight_id,
@@ -586,11 +605,14 @@ def run(db_path: Path = DB_PATH) -> None:
 
     fights = load_raw("fights")
     n_fights, n_stats = upsert_fights(conn, fights)
+    n_removed_from_upcoming = remove_completed_fights_from_upcoming(conn)
 
     print(
         f"cleaner: wrote {n_fighters} fighters, {n_events} events, "
         f"{n_fights} fights, {n_stats} fight_stats rows -> {db_path}"
     )
+    if n_removed_from_upcoming:
+        print(f"cleaner: removed {n_removed_from_upcoming} now-completed fight(s) from upcoming_fights")
 
     try:
         bfo_events = load_raw("odds_bestfightodds")

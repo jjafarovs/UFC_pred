@@ -107,3 +107,41 @@ CREATE TABLE IF NOT EXISTS odds (
 );
 
 CREATE INDEX IF NOT EXISTS idx_odds_fight ON odds(fight_id);
+
+-- One snapshot per (fight, day) -- keyed this way, not one row per page view,
+-- so re-viewing the same card repeatedly in a Streamlit session (which
+-- reruns the whole script on every widget interaction) upserts the latest
+-- snapshot for today rather than spamming duplicate rows. A new calendar
+-- day for the same still-upcoming fight_id gets its own row, so the
+-- prediction's evolution as odds move is preserved, not overwritten.
+-- Exists specifically to fix a real gap: the dashboard used to be
+-- stateless, so a losing stretch could never be forensically analyzed --
+-- there was no record of what was actually predicted at the time.
+CREATE TABLE IF NOT EXISTS prediction_log (
+    fight_id                        TEXT NOT NULL,
+    log_date                        TEXT NOT NULL,   -- ISO date this snapshot was taken
+    fighter_1_id                    TEXT NOT NULL,
+    fighter_2_id                    TEXT NOT NULL,
+    fighter_1_name                  TEXT,
+    fighter_2_name                  TEXT,
+    event_id                        TEXT,
+    event_name                      TEXT,
+    event_date                      TEXT,
+    weight_class                    TEXT,
+    title_fight                     INTEGER,
+    logistic_prob_fighter_1         REAL,
+    gbm_prob_fighter_1              REAL,
+    avg_prob_fighter_1              REAL,
+    market_prob_fighter_1           REAL,
+    edge_fighter_1                  REAL,
+    confidence                      TEXT,
+    refined_signal                   TEXT,    -- 'fighter_1' | 'fighter_2' | NULL
+    refined_plus_signal             TEXT,    -- adds: exclude Heavyweight/Light Heavyweight, odds<2.0 ceiling
+    elo_signal                      TEXT,    -- adds: exclude Southpaw-vs-Orthodox matchups
+    market_decimal_odds_fighter_1   REAL,
+    market_decimal_odds_fighter_2   REAL,
+    logged_at                       TEXT NOT NULL,  -- ISO timestamp of this specific upsert
+    PRIMARY KEY (fight_id, log_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_prediction_log_event_date ON prediction_log(event_date);

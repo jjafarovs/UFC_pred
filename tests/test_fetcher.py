@@ -5,6 +5,7 @@ were cross-checked by hand against that HTML. If ufcstats changes its markup,
 these should fail loudly rather than silently parsing garbage.
 """
 from pathlib import Path
+from unittest.mock import MagicMock
 
 from src import fetcher
 
@@ -168,3 +169,26 @@ def test_merge_by_key_refreshes_a_re_fetched_entry_rather_than_duplicating_it():
 
     assert len(merged) == 1
     assert merged[0]["name"] == "Fresh Name"
+
+
+def test_solve_pow_submission_has_a_timeout():
+    """Regression test: this POST previously had no timeout at all, unlike
+    every other request in this file -- a stall here hung the whole fetch
+    (and the dashboard's Refresh button, which blocks on it) indefinitely,
+    with no way to recover short of manually killing the process. Confirmed
+    in practice, not just in theory: a real refresh sat stuck for 12+
+    minutes with near-zero CPU use, which pointed at blocked network I/O
+    rather than the SHA-256 grind (that finishes in well under a second).
+    """
+    client = fetcher.UFCStatsClient()
+    client.session.post = MagicMock(return_value=MagicMock(status_code=200))
+    # target difficulty 0 -> "0" * 0 == "", and every hash starts with "" ->
+    # solved on the very first attempt (n=0), so this test is instant
+    # regardless of the real site's actual difficulty.
+    html = 'nonce="deadbeef" ... new Array(0+1) ...'
+
+    solved = client._solve_pow(html)
+
+    assert solved is True
+    client.session.post.assert_called_once()
+    assert client.session.post.call_args.kwargs.get("timeout") == 20

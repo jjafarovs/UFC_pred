@@ -597,6 +597,45 @@ not a validated positive edge. The search continues to point the same
 direction as before: incremental box-score-style features are close to
 exhausted as a source of new signal against this market.
 
+### Per-round data: the one genuinely new data source, not another box-score ratio
+
+After the betting-strategy work below found a real, validated edge (see
+`src/strategy.py`), the natural next question was whether the *model
+itself* could be made stronger for every fight, not just more selective.
+Checked directly: just backing the market's own favorite (no model at all)
+gets 69.3% accuracy on odds-covered fights -- our model gets 68.9-69.2%,
+essentially matching the market rather than trailing it, and a properly
+built stacked ensemble (a meta-model on held-out calibration predictions,
+not just averaging logistic + GBM) produced the exact same accuracy as
+plain averaging (68.2% either way) -- the two base models are too
+correlated for stacking to extract anything new. Both results are
+consistent with everything else in this project: box-score-derived
+features are close to exhausted.
+
+`diff_fade_rate` (`features.fighter_rolling_features`) is different -- it's
+the first feature built from data that was previously scraped but never
+used at all: `fight_stats`' per-round rows (round 1..5), versus every prior
+feature using only the round=0 season-total row. It's a cardio/fade proxy:
+ratio of a fighter's own significant-strike output in the last FULL round
+of a fight vs their round-1 output, averaged over their rolling window.
+Deliberately compares against `end_round - 1`, not the fight's actual last
+round -- a finish's last round is partial (cut short mid-round), not a fair
+comparison to a full 5-minute round 1 -- and excludes fights that ended in
+round 1 or 2 entirely, since there's no full late round to compare (~57%
+coverage: 4,856 of 8,782 fights went 3+ rounds).
+
+Validated on the strongest known strategy configuration (REFINED + odds
+ceiling + excluding Heavyweight/Light Heavyweight, see below) across the
+same 5-fold robustness sweep used throughout this project: improved ROI/CI
+in 4 of 5 folds, neutral (not worse) in the 5th, never regressed. Overall
+walk-forward accuracy stayed flat (69.2%/66.7%), consistent with the
+finding above that raw accuracy is already at the market-matching ceiling
+-- but GBM's log loss improved meaningfully (0.634 -> 0.606), and the
+improvement shows up specifically where it matters, in the selective
+strategy's ROI. Added to `model.FEATURE_COLUMNS`; both production models
+retrained, verified to still respond correctly to `market_prob_fighter_1`,
+and re-promoted.
+
 ## Reporting
 
 `src/report.py` takes a list of upcoming matchups (fighter ID pairs) and
@@ -768,10 +807,14 @@ pinned older model keeps working correctly no matter how many new features
 get added to the code later.
 
 **Betting-strategy highlighting** (`src/strategy.py`): the sidebar's
-Original/Tighter/Refined checkboxes highlight whichever fights each
+Refined/Refined+/Elo checkboxes highlight whichever fights each
 model-confidence rule flags as bettable, with the exact rule(s) spelled out
-per row (e.g. "Original + Refined") rather than a generic tier -- see that
-module's docstring for the full backtest numbers behind each rule.
+per row (e.g. "Refined + Elo") rather than a generic tier -- see that
+module's docstring for the full backtest numbers behind each rule. (The
+original Original/Tighter rules were retired once the model/data evolved
+past them; Elo is named for `features.build_elo_ratings`' career-long,
+opponent-strength-weighted rating feature, which improved every rule once
+added to the model, not just its own.)
 
 **Two more bugs caught by actually running the app** (terminal noise the
 user reported was real, not cosmetic, in one case): (1) the fight-detail

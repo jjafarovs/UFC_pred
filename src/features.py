@@ -36,18 +36,24 @@ def fights_before(conn: sqlite3.Connection, fighter_id: str, as_of_date: str, n:
     """
     query = """
         SELECT
-            f.fight_id, f.event_date, f.winner_id, f.result, f.method,
+            f.fight_id, f.event_date, f.winner_id, f.result, f.method, f.end_round,
             fs_self.sig_str_landed AS self_sig_landed, fs_self.sig_str_attempted AS self_sig_attempted,
             fs_self.takedowns_landed AS self_td_landed, fs_self.takedowns_attempted AS self_td_attempted,
             fs_self.control_time_sec AS self_control_time_sec,
             fs_opp.sig_str_landed AS opp_sig_landed, fs_opp.sig_str_attempted AS opp_sig_attempted,
             fs_opp.takedowns_landed AS opp_td_landed, fs_opp.takedowns_attempted AS opp_td_attempted,
-            fs_opp.control_time_sec AS opp_control_time_sec
+            fs_opp.control_time_sec AS opp_control_time_sec,
+            fs_r1.sig_str_landed AS self_round1_sig_landed,
+            fs_rlate.sig_str_landed AS self_late_round_sig_landed
         FROM fights f
         JOIN fight_stats fs_self
             ON fs_self.fight_id = f.fight_id AND fs_self.fighter_id = :fighter_id AND fs_self.round = 0
         JOIN fight_stats fs_opp
             ON fs_opp.fight_id = f.fight_id AND fs_opp.fighter_id != :fighter_id AND fs_opp.round = 0
+        LEFT JOIN fight_stats fs_r1
+            ON fs_r1.fight_id = f.fight_id AND fs_r1.fighter_id = :fighter_id AND fs_r1.round = 1
+        LEFT JOIN fight_stats fs_rlate
+            ON fs_rlate.fight_id = f.fight_id AND fs_rlate.fighter_id = :fighter_id AND fs_rlate.round = f.end_round - 1
         WHERE (f.fighter_1_id = :fighter_id OR f.fighter_2_id = :fighter_id)
           AND f.event_date < :as_of_date
         ORDER BY f.event_date DESC
@@ -83,6 +89,7 @@ def fighter_rolling_features(conn: sqlite3.Connection, fighter_id: str, as_of_da
         "td_def": None,
         "days_since_last_fight": None,
         "control_time_pct": None,
+        "fade_rate": None,
     }
     if n_prior == 0:
         return empty
@@ -118,6 +125,24 @@ def fighter_rolling_features(conn: sqlite3.Connection, fighter_id: str, as_of_da
     td_def = _safe_ratio(opp_td_landed, opp_td_attempted)
     control_time_pct = _safe_ratio(self_control_time, self_control_time + opp_control_time)
 
+    # Per-round output trend (cardio/fade proxy) -- genuinely new information,
+    # not another ratio of the same round=0 totals every other feature here
+    # uses. Only fights that went 3+ rounds have this (fights_before's
+    # LEFT JOIN on round=1 and round=end_round-1 -- both guaranteed FULL,
+    # uncontaminated rounds, unlike the fight's actual last round, which is
+    # partial in a finish and not a fair comparison to a full round 1).
+    # Averages the per-fight ratio (not summed landed counts first) since
+    # "how much did output drop late" is inherently a per-fight comparison,
+    # not something that should be dominated by one high-volume fight.
+    fade_ratios = [
+        r["self_late_round_sig_landed"] / r["self_round1_sig_landed"]
+        for r in rows
+        if r["end_round"] is not None and r["end_round"] >= 3
+        and r["self_round1_sig_landed"] not in (None, 0)
+        and r["self_late_round_sig_landed"] is not None
+    ]
+    fade_rate = sum(fade_ratios) / len(fade_ratios) if fade_ratios else None
+
     most_recent_date = datetime.fromisoformat(rows[0]["event_date"]).date()
     as_of = datetime.fromisoformat(as_of_date).date()
 
@@ -131,6 +156,7 @@ def fighter_rolling_features(conn: sqlite3.Connection, fighter_id: str, as_of_da
         "td_def": 1 - td_def if td_def is not None else None,
         "days_since_last_fight": (as_of - most_recent_date).days,
         "control_time_pct": control_time_pct,
+        "fade_rate": fade_rate,
     }
 
 
@@ -191,12 +217,118 @@ def fighter_career_features(conn: sqlite3.Connection, fighter_id: str, as_of_dat
     }
 
 
-def matchup_feature_dict(conn: sqlite3.Connection, fighter_1_id: str, fighter_2_id: str, as_of_date: str, n: int = 5) -> dict:
+def build_elo_ratings(conn: sqlite3.Connection, k_base: float = 32.0) -> dict[str, list[tuple[str, float]]]:
+    """A career-long (not windowed) Elo rating per fighter, K-boosted 1.5x for
+    a finish (KO/TKO or Submission) vs. a decision -- a finish is a stronger
+    signal of dominance than a close decision, so it should move the rating
+    more. Returns {fighter_id: [(event_date, rating_after_this_fight), ...]}
+    in ascending event_date order per fighter.
+
+    This is the ONE function in this module allowed to scan `fights` directly
+    rather than routing through fights_before(): Elo is inherently a GLOBAL
+    sequential state (today's rating depends on everyone's chronological
+    history, not just one fighter's own past fights), not a per-fighter
+    as-of-date rollup, so fights_before()'s per-fighter-query shape doesn't
+    fit it. Leak safety is instead guaranteed by construction: fights are
+    processed in a single ascending-event_date pass, and each fight's own
+    rating UPDATE is only ever applied after that fight's pre-fight ratings
+    have already been used/recorded -- so a fighter's rating at any point in
+    this timeline reflects only fights strictly before it, same invariant as
+    everywhere else in this module, just enforced by processing order rather
+    than a WHERE clause. fighter_elo_as_of() enforces the actual `event_date <
+    as_of_date` cut a caller needs, on top of this.
+
+    Deliberately global+O(n) rather than recomputed per fighter per lookup
+    (which a naive fights_before()-style per-fighter query would do): a
+    fighter's rating depends on every opponent they've beaten and what THOSE
+    opponents' records looked like, so building it fighter-by-fighter would
+    mean re-deriving the whole history's cross-dependencies redundantly once
+    per fighter. A single pass takes ~30ms over this project's full history
+    (8,676 fights) -- cheap enough to recompute on every call, including live
+    dashboard renders, rather than needing a cache.
+    """
+    rows = conn.execute(
+        "SELECT fight_id, event_date, winner_id, method, fighter_1_id, fighter_2_id "
+        "FROM fights WHERE result IN ('fighter_1', 'fighter_2') "
+        "ORDER BY event_date ASC, fight_id ASC"
+    ).fetchall()
+
+    current: dict[str, float] = {}
+    timeline: dict[str, list[tuple[str, float]]] = {}
+    for r in rows:
+        f1, f2 = r["fighter_1_id"], r["fighter_2_id"]
+        e1, e2 = current.get(f1, 1500.0), current.get(f2, 1500.0)
+
+        actual1 = 1.0 if r["winner_id"] == f1 else 0.0
+        expected1 = 1.0 / (1.0 + 10 ** (-(e1 - e2) / 400.0))
+        k = k_base * 1.5 if r["method"] in ("KO/TKO", "Submission") else k_base
+        new_e1 = e1 + k * (actual1 - expected1)
+        new_e2 = e2 + k * ((1 - actual1) - (1 - expected1))
+
+        current[f1], current[f2] = new_e1, new_e2
+        timeline.setdefault(f1, []).append((r["event_date"], new_e1))
+        timeline.setdefault(f2, []).append((r["event_date"], new_e2))
+    return timeline
+
+
+def fighter_elo_as_of(elo_timeline: dict[str, list[tuple[str, float]]], fighter_id: str, as_of_date: str) -> float:
+    """A fighter's Elo rating as of `as_of_date`: the rating AFTER their most
+    recent fight strictly before that date (the default 1500.0 -- Elo's
+    standard starting rating -- if they have no qualifying fight yet, which
+    doubles as a sensible neutral value for a promotional debut). Each
+    fighter's list in `elo_timeline` is already in ascending event_date order
+    (build_elo_ratings appends in that order), so this can stop at the first
+    date that's no longer strictly before as_of_date rather than scanning
+    the whole list.
+    """
+    rating = 1500.0
+    for event_date, elo in elo_timeline.get(fighter_id, []):
+        if event_date >= as_of_date:
+            break
+        rating = elo
+    return rating
+
+
+def elo_prob_feature(
+    elo_timeline: dict[str, list[tuple[str, float]]], fighter_1_id: str, fighter_2_id: str, as_of_date: str
+) -> float:
+    """Elo's own implied win probability for fighter_1, from both fighters'
+    as-of-date Elo ratings -- fed to the model the same way market_prob_
+    feature is (a domain model's own probability estimate, not just a raw
+    rating difference), except this one is ALWAYS available (100% coverage,
+    vs. market_prob's ~26%), since Elo needs no matched odds to exist.
+
+    Validated via walk-forward + bootstrap CI: adding this single feature
+    took the plain "Refined" strategy from CI [-0.0%,+12.6%] (not
+    distinguishable from noise) to [+3.2%,+15.6%] (significant), and
+    improved every fold-size robustness variant tested (150/200/300) for
+    the more selective "Refined+" strategy too. See strategy.py's ELO_RULE
+    docstring for the full numbers.
+    """
+    e1 = fighter_elo_as_of(elo_timeline, fighter_1_id, as_of_date)
+    e2 = fighter_elo_as_of(elo_timeline, fighter_2_id, as_of_date)
+    return 1.0 / (1.0 + 10 ** (-(e1 - e2) / 400.0))
+
+
+def matchup_feature_dict(
+    conn: sqlite3.Connection,
+    fighter_1_id: str,
+    fighter_2_id: str,
+    as_of_date: str,
+    n: int = 5,
+    elo_timeline: dict[str, list[tuple[str, float]]] | None = None,
+) -> dict:
     """The feature computation shared by build_fight_feature_row (training,
     where the matchup is a completed fight already in the DB) and report.py
     (a genuinely upcoming matchup that doesn't need to exist in the fights
     table at all, since it hasn't happened yet). One implementation, so a
     report can never silently diverge from how training features are built.
+
+    `elo_timeline` should come from build_elo_ratings(conn) -- callers build
+    it ONCE (it's a global, not a per-matchup, computation) and pass it in
+    here for every matchup, rather than this function rebuilding it on every
+    call. None is accepted for callers that don't need the Elo feature
+    (elo_prob_fighter_1 is then omitted rather than fabricated).
     """
     f1_roll = fighter_rolling_features(conn, fighter_1_id, as_of_date, n=n)
     f2_roll = fighter_rolling_features(conn, fighter_2_id, as_of_date, n=n)
@@ -226,9 +358,15 @@ def matchup_feature_dict(conn: sqlite3.Connection, fighter_1_id: str, fighter_2_
         "diff_finish_rate": diff("finish_rate", f1_career, f2_career),
         "diff_times_finished_rate": diff("times_finished_rate", f1_career, f2_career),
         "diff_control_time_pct": diff("control_time_pct", f1_roll, f2_roll),
+        "diff_fade_rate": diff("fade_rate", f1_roll, f2_roll),
         "same_stance": (
             f1_phys["stance"] == f2_phys["stance"]
             if f1_phys["stance"] and f2_phys["stance"]
+            else None
+        ),
+        "elo_prob_fighter_1": (
+            elo_prob_feature(elo_timeline, fighter_1_id, fighter_2_id, as_of_date)
+            if elo_timeline is not None
             else None
         ),
     }
@@ -263,7 +401,12 @@ def market_prob_feature(conn: sqlite3.Connection, fight_id: str, fighter_1_id: s
     return market.market_probabilities_for_fight(conn, fight_id, odds_type=odds_type).get(fighter_1_id)
 
 
-def build_fight_feature_row(conn: sqlite3.Connection, fight: sqlite3.Row, n: int = 5) -> dict | None:
+def build_fight_feature_row(
+    conn: sqlite3.Connection,
+    fight: sqlite3.Row,
+    n: int = 5,
+    elo_timeline: dict[str, list[tuple[str, float]]] | None = None,
+) -> dict | None:
     """One training row for a completed fight: fighter_1-minus-fighter_2
     feature differences, as of the day of the fight, plus the label. Returns
     None for draws/no-contests -- there's no winner to learn from.
@@ -272,7 +415,7 @@ def build_fight_feature_row(conn: sqlite3.Connection, fight: sqlite3.Row, n: int
         return None
 
     as_of_date = fight["event_date"]
-    row = matchup_feature_dict(conn, fight["fighter_1_id"], fight["fighter_2_id"], as_of_date, n=n)
+    row = matchup_feature_dict(conn, fight["fighter_1_id"], fight["fighter_2_id"], as_of_date, n=n, elo_timeline=elo_timeline)
     row.update(
         {
             "fight_id": fight["fight_id"],
@@ -298,7 +441,8 @@ def build_feature_matrix(conn: sqlite3.Connection, n: int = 5) -> pd.DataFrame:
         "SELECT fight_id, event_date, fighter_1_id, fighter_2_id, winner_id, result "
         "FROM fights ORDER BY event_date ASC"
     ).fetchall()
-    rows = [build_fight_feature_row(conn, f, n=n) for f in fights]
+    elo_timeline = build_elo_ratings(conn)
+    rows = [build_fight_feature_row(conn, f, n=n, elo_timeline=elo_timeline) for f in fights]
     rows = [r for r in rows if r is not None]
     return pd.DataFrame(rows)
 

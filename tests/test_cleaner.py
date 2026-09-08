@@ -213,3 +213,69 @@ def test_upsert_upcoming_card_skips_unparseable_dates(populated_db):
                "weight_class": "Lightweight", "title_fight": False, "result": "scheduled"}]
     n = cleaner.upsert_upcoming_card(populated_db, events, fights)
     assert n == 0
+
+
+def test_remove_completed_fights_from_upcoming_purges_stale_entries(populated_db):
+    """Regression test for a real bug: refresh.py's --mode full fetches
+    completed results but never re-fetches/rewrites upcoming_fights, so a
+    card that just finished lingered there with a stale LIVE odds line --
+    while the SAME fight also correctly appeared in Past Cards using the
+    real CLOSING line, showing different numbers for one fight in two tabs.
+    "fight1" is already a real completed fight in `fights` per FIXTURE_RAW;
+    simulate the stale-lingering-entry bug by also inserting it into
+    upcoming_fights, matching what --mode full actually leaves behind.
+    """
+    populated_db.execute(
+        "INSERT INTO upcoming_fights (fight_id, event_id, event_date, fighter_1_id, fighter_2_id, scraped_at) "
+        "VALUES ('fight1', 'e1', '2026-06-27', 'f1', 'f2', 'now')"
+    )
+    populated_db.commit()
+
+    n_removed = cleaner.remove_completed_fights_from_upcoming(populated_db)
+
+    assert n_removed == 1
+    remaining = populated_db.execute("SELECT fight_id FROM upcoming_fights WHERE fight_id='fight1'").fetchall()
+    assert remaining == []
+
+
+def test_remove_completed_fights_from_upcoming_leaves_genuinely_upcoming_fights_alone(populated_db):
+    populated_db.execute(
+        "INSERT INTO upcoming_fights (fight_id, event_id, event_date, fighter_1_id, fighter_2_id, scraped_at) "
+        "VALUES ('fight_not_yet_fought', 'e1', '2026-08-01', 'f1', 'f2', 'now')"
+    )
+    populated_db.commit()
+
+    n_removed = cleaner.remove_completed_fights_from_upcoming(populated_db)
+
+    assert n_removed == 0
+    remaining = populated_db.execute("SELECT fight_id FROM upcoming_fights WHERE fight_id='fight_not_yet_fought'").fetchall()
+    assert len(remaining) == 1
+
+
+def test_run_purges_stale_upcoming_entries_end_to_end(tmp_path, monkeypatch):
+    """The full cleaner.run() path (not just the helper in isolation) must
+    apply this cleanup automatically on every run, regardless of mode.
+    """
+    monkeypatch.setattr(cleaner, "load_raw", _fake_load_raw)
+    db_path = tmp_path / "test_e2e.db"
+    conn = cleaner.get_connection(db_path)
+    cleaner.init_db(conn)
+    # upcoming_fights.fighter_1_id/fighter_2_id are FKs to fighters -- must
+    # exist before the pre-seeded row below, since this DB is fresh (the
+    # real fighters/fights upsert from cleaner.run() hasn't happened yet).
+    conn.execute("INSERT INTO fighters (fighter_id, name, scraped_at) VALUES ('f1', 'Fighter One', 'now')")
+    conn.execute("INSERT INTO fighters (fighter_id, name, scraped_at) VALUES ('f2', 'Fighter Two', 'now')")
+    # Pre-seed a stale upcoming_fights row for "fight1", as if a prior
+    # --mode upcoming run had captured it before it was actually fought.
+    conn.execute(
+        "INSERT INTO upcoming_fights (fight_id, event_id, event_date, fighter_1_id, fighter_2_id, scraped_at) "
+        "VALUES ('fight1', 'e1', '2026-06-27', 'f1', 'f2', 'now')"
+    )
+    conn.commit()
+    conn.close()
+
+    cleaner.run(db_path=db_path)
+
+    conn = sqlite3.connect(db_path)
+    remaining = conn.execute("SELECT fight_id FROM upcoming_fights WHERE fight_id='fight1'").fetchall()
+    assert remaining == []

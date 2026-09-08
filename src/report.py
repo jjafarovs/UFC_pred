@@ -179,12 +179,16 @@ def build_card_report(
     skipping this broke the dashboard).
     """
     feature_columns = feature_columns if feature_columns is not None else model.FEATURE_COLUMNS
+    # Built ONCE per report (a global computation, not a per-matchup one) --
+    # see features.build_elo_ratings's docstring on why it isn't threaded
+    # through fights_before() like everything else here.
+    elo_timeline = features.build_elo_ratings(conn)
     rows = []
     for fighter_1_id, fighter_2_id in matchups:
         market_probs = market.market_probabilities_for_matchup(conn, fighter_1_id, fighter_2_id, odds_type=odds_type)
         market_prob = market_probs.get(fighter_1_id)
 
-        feat = features.matchup_feature_dict(conn, fighter_1_id, fighter_2_id, as_of_date, n=n)
+        feat = features.matchup_feature_dict(conn, fighter_1_id, fighter_2_id, as_of_date, n=n, elo_timeline=elo_timeline)
         feat["market_prob_fighter_1"] = market_prob
         X = pd.DataFrame([feat])[feature_columns].astype(float)
         model_prob = float(fitted_model.predict_proba(X)[0, 1])
@@ -206,6 +210,81 @@ def build_card_report(
                 # label anymore, so it needs to be a real column here.
                 "f1_n_prior_fights": feat["f1_n_prior_fights"],
                 "f2_n_prior_fights": feat["f2_n_prior_fights"],
+                # Raw (not de-vigged) decimal odds -- needed by strategy.bet_signal's
+                # REFINED_PLUS_RULE odds-ceiling filter, which gates on an actual
+                # payout price rather than a probability.
+                "fighter_1_decimal_odds": market.average_decimal_odds_for_matchup(conn, fighter_1_id, odds_type=odds_type),
+                "fighter_2_decimal_odds": market.average_decimal_odds_for_matchup(conn, fighter_2_id, odds_type=odds_type),
+                # Raw stance strings (distinct from the model's own boolean
+                # same_stance FEATURE) -- needed by strategy.bet_signal's
+                # ELO_RULE cross-stance filter, which needs to know WHICH two
+                # stances, not just whether they match.
+                "fighter_1_stance": features.fighter_physical_features(conn, fighter_1_id, as_of_date)["stance"],
+                "fighter_2_stance": features.fighter_physical_features(conn, fighter_2_id, as_of_date)["stance"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_historical_card_report(
+    conn: sqlite3.Connection,
+    fitted_model,
+    fights: list,
+    n: int = 5,
+    calibration_table: list[dict] | None = None,
+    feature_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Like build_card_report, but for fights that have ALREADY happened and
+    are in the `fights` table -- for the dashboard's "Past Cards" view.
+
+    Two differences from build_card_report, both because the fight already
+    has a real fight_id and a known outcome: (1) market probability comes
+    from market.market_probabilities_for_fight (the verified CLOSING line,
+    odds_type='close') rather than market_probabilities_for_matchup's
+    fight_id-less live-line lookup -- there's no reason to use a live line
+    for something that's already been settled; (2) the actual result is
+    included, so a past card's picks can be checked for correctness.
+
+    `fights` is a list of sqlite3.Row from the `fights` table (needs
+    fight_id, fighter_1_id, fighter_2_id, event_date, result, winner_id).
+    """
+    feature_columns = feature_columns if feature_columns is not None else model.FEATURE_COLUMNS
+    elo_timeline = features.build_elo_ratings(conn)
+    rows = []
+    for fight in fights:
+        fighter_1_id, fighter_2_id = fight["fighter_1_id"], fight["fighter_2_id"]
+        as_of_date = fight["event_date"]
+        market_probs = market.market_probabilities_for_fight(conn, fight["fight_id"], odds_type="close")
+        market_prob = market_probs.get(fighter_1_id)
+
+        feat = features.matchup_feature_dict(conn, fighter_1_id, fighter_2_id, as_of_date, n=n, elo_timeline=elo_timeline)
+        feat["market_prob_fighter_1"] = market_prob
+        X = pd.DataFrame([feat])[feature_columns].astype(float)
+        model_prob = float(fitted_model.predict_proba(X)[0, 1])
+
+        edge = market.compute_edge(model_prob, market_prob) if market_prob is not None else None
+
+        rows.append(
+            {
+                "fight_id": fight["fight_id"],
+                "fighter_1_id": fighter_1_id,
+                "fighter_2_id": fighter_2_id,
+                "fighter_1": fighter_display_name(conn, fighter_1_id),
+                "fighter_2": fighter_display_name(conn, fighter_2_id),
+                "model_prob_fighter_1": model_prob,
+                "market_prob_fighter_1": market_prob,
+                "edge_fighter_1": edge,
+                "confidence": _confidence_label(
+                    feat["f1_n_prior_fights"], feat["f2_n_prior_fights"], model_prob, calibration_table
+                ),
+                "f1_n_prior_fights": feat["f1_n_prior_fights"],
+                "f2_n_prior_fights": feat["f2_n_prior_fights"],
+                "fighter_1_decimal_odds": market.average_decimal_odds_for_fight(conn, fight["fight_id"], fighter_1_id, odds_type="close"),
+                "fighter_2_decimal_odds": market.average_decimal_odds_for_fight(conn, fight["fight_id"], fighter_2_id, odds_type="close"),
+                "fighter_1_stance": features.fighter_physical_features(conn, fighter_1_id, as_of_date)["stance"],
+                "fighter_2_stance": features.fighter_physical_features(conn, fighter_2_id, as_of_date)["stance"],
+                "result": fight["result"],
+                "winner_id": fight["winner_id"],
             }
         )
     return pd.DataFrame(rows)

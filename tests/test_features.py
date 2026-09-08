@@ -212,6 +212,165 @@ def test_fighter_career_features_only_counts_fights_before_as_of_date(fighter_a_
     assert result["finish_rate"] == pytest.approx(1.0)  # the only win was a KO
 
 
+def _insert_round_stats(conn, fight_id, fighter_id, round_num, sig_l):
+    conn.execute(
+        "INSERT INTO fight_stats (fight_id, fighter_id, round, sig_str_landed, sig_str_attempted) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (fight_id, fighter_id, round_num, sig_l, sig_l + 10),
+    )
+
+
+@pytest.fixture
+def fighter_a_round_history(tmp_path):
+    """Fighter A has 3 fights, each providing round-level stats:
+    fight1 (3 rounds, went the full 3): round1=40 landed, round2=20 landed -- clear fade (0.5 ratio).
+    fight2 (1 round only, a first-round finish): no fade data -- must be excluded, not treated as ratio 1.0.
+    fight3 (5 rounds): round1=30 landed, round4=30 landed -- no fade (ratio 1.0).
+    """
+    conn = _make_db(tmp_path)
+    for fid, name in [("fA", "Fighter A"), ("fB", "Fighter B"), ("fC", "Fighter C"), ("fD", "Fighter D")]:
+        _insert_fighter(conn, fid, name)
+    _insert_event(conn, "e1", "Event 1", "2026-01-01")
+    _insert_event(conn, "e2", "Event 2", "2026-02-01")
+    _insert_event(conn, "e3", "Event 3", "2026-03-01")
+
+    _insert_fight(conn, "fight1", "e1", "2026-01-01", "fA", "fB", "fA",
+                  {"fA": {"sig_l": 60, "sig_a": 100, "td_l": 0, "td_a": 0},
+                   "fB": {"sig_l": 30, "sig_a": 80, "td_l": 0, "td_a": 0}})
+    conn.execute("UPDATE fights SET end_round=3 WHERE fight_id='fight1'")
+    _insert_round_stats(conn, "fight1", "fA", 1, sig_l=40)
+    _insert_round_stats(conn, "fight1", "fA", 2, sig_l=20)  # end_round-1 = 2 -> the "late" round used
+
+    _insert_fight(conn, "fight2", "e2", "2026-02-01", "fA", "fC", "fA",
+                  {"fA": {"sig_l": 15, "sig_a": 20, "td_l": 0, "td_a": 0},
+                   "fC": {"sig_l": 5, "sig_a": 15, "td_l": 0, "td_a": 0}})
+    conn.execute("UPDATE fights SET end_round=1 WHERE fight_id='fight2'")
+    _insert_round_stats(conn, "fight2", "fA", 1, sig_l=15)  # only round 1 exists -- a first-round finish
+
+    _insert_fight(conn, "fight3", "e3", "2026-03-01", "fA", "fD", "fA",
+                  {"fA": {"sig_l": 90, "sig_a": 150, "td_l": 0, "td_a": 0},
+                   "fD": {"sig_l": 40, "sig_a": 100, "td_l": 0, "td_a": 0}})
+    conn.execute("UPDATE fights SET end_round=5 WHERE fight_id='fight3'")
+    _insert_round_stats(conn, "fight3", "fA", 1, sig_l=30)
+    _insert_round_stats(conn, "fight3", "fA", 4, sig_l=30)  # end_round-1 = 4 -> the "late" round used
+
+    conn.commit()
+    return conn
+
+
+def test_fade_rate_averages_only_fights_with_a_valid_late_round_comparison(fighter_a_round_history):
+    conn = fighter_a_round_history
+    result = features.fighter_rolling_features(conn, "fA", "2026-04-01", n=5)
+    # fight2 (1-round finish) must be excluded entirely, not counted as a
+    # ratio of 1.0 -- only fight1 (0.5) and fight3 (1.0) contribute.
+    assert result["fade_rate"] == pytest.approx((0.5 + 1.0) / 2)
+
+
+def test_fade_rate_respects_the_as_of_date_leakage_guard(fighter_a_round_history):
+    conn = fighter_a_round_history
+    # As of right after fight1, only fight1's ratio (0.5) is available.
+    result = features.fighter_rolling_features(conn, "fA", "2026-01-15", n=5)
+    assert result["fade_rate"] == pytest.approx(0.5)
+
+
+def test_fade_rate_is_none_when_no_fight_in_window_qualifies(tmp_path):
+    conn = _make_db(tmp_path)
+    _insert_fighter(conn, "fA", "Fighter A")
+    _insert_fighter(conn, "fB", "Fighter B")
+    _insert_event(conn, "e1", "Event 1", "2026-01-01")
+    _insert_fight(conn, "fight1", "e1", "2026-01-01", "fA", "fB", "fA",
+                  {"fA": {"sig_l": 15, "sig_a": 20, "td_l": 0, "td_a": 0},
+                   "fB": {"sig_l": 5, "sig_a": 15, "td_l": 0, "td_a": 0}})
+    conn.execute("UPDATE fights SET end_round=1 WHERE fight_id='fight1'")  # first-round finish only
+    conn.commit()
+
+    result = features.fighter_rolling_features(conn, "fA", "2026-02-01", n=5)
+    assert result["fade_rate"] is None
+
+
+@pytest.fixture
+def elo_history(tmp_path):
+    """A beats B (2026-01-01, decision), then B beats C (2026-02-01, KO)."""
+    conn = _make_db(tmp_path)
+    for fid, name in [("fA", "Fighter A"), ("fB", "Fighter B"), ("fC", "Fighter C")]:
+        _insert_fighter(conn, fid, name)
+    _insert_event(conn, "e1", "Event 1", "2026-01-01")
+    _insert_event(conn, "e2", "Event 2", "2026-02-01")
+    _insert_fight(conn, "fight1", "e1", "2026-01-01", "fA", "fB", "fA",
+                  {"fA": {"sig_l": 10, "sig_a": 20, "td_l": 0, "td_a": 0},
+                   "fB": {"sig_l": 5, "sig_a": 15, "td_l": 0, "td_a": 0}},
+                  method="Decision - Unanimous")
+    _insert_fight(conn, "fight2", "e2", "2026-02-01", "fB", "fC", "fB",
+                  {"fB": {"sig_l": 10, "sig_a": 20, "td_l": 0, "td_a": 0},
+                   "fC": {"sig_l": 5, "sig_a": 15, "td_l": 0, "td_a": 0}},
+                  method="KO/TKO")
+    conn.commit()
+    return conn
+
+
+def test_build_elo_ratings_starts_everyone_at_1500_and_updates_after_a_win(elo_history):
+    conn = elo_history
+    timeline = features.build_elo_ratings(conn)
+    # fA's rating after beating fB (both started at 1500, even matchup) went up.
+    assert timeline["fA"][0][1] > 1500.0
+    # fB's rating after LOSING to fA went down.
+    assert timeline["fB"][0][1] < 1500.0
+
+
+def test_build_elo_ratings_weights_a_finish_more_than_a_decision(elo_history):
+    conn = elo_history
+    timeline = features.build_elo_ratings(conn)
+    # fA's decision win margin vs fB (both starting at 1500).
+    decision_gain = timeline["fA"][0][1] - 1500.0
+    # fB's KO win margin vs fC -- fB entered this fight already BELOW 1500
+    # (having just lost fight1), which on its own would shrink a same-size
+    # gain; the 1.5x finish multiplier must still win out.
+    ko_gain = timeline["fB"][1][1] - timeline["fB"][0][1]
+    assert ko_gain > decision_gain
+
+
+def test_fighter_elo_as_of_respects_the_as_of_date_leakage_guard(elo_history):
+    conn = elo_history
+    timeline = features.build_elo_ratings(conn)
+    # Before fA's only fight: still the 1500.0 default.
+    assert features.fighter_elo_as_of(timeline, "fA", "2026-01-01") == 1500.0
+    # After fight1 but before/on fight2's date (fA isn't in fight2): fA's
+    # rating reflects fight1, not anything from fB/fC's later fight.
+    assert features.fighter_elo_as_of(timeline, "fA", "2026-02-01") == pytest.approx(timeline["fA"][0][1])
+    # fB's rating as of a date between its two fights reflects only fight1.
+    assert features.fighter_elo_as_of(timeline, "fB", "2026-02-01") == pytest.approx(timeline["fB"][0][1])
+    # fB's rating strictly after fight2 reflects both fights.
+    assert features.fighter_elo_as_of(timeline, "fB", "2026-03-01") == pytest.approx(timeline["fB"][1][1])
+
+
+def test_fighter_elo_as_of_defaults_to_1500_for_an_unknown_fighter(elo_history):
+    conn = elo_history
+    timeline = features.build_elo_ratings(conn)
+    assert features.fighter_elo_as_of(timeline, "nobody", "2026-06-01") == 1500.0
+
+
+def test_elo_prob_feature_favors_the_higher_rated_fighter(elo_history):
+    conn = elo_history
+    timeline = features.build_elo_ratings(conn)
+    # As of after both fights: fA (1 win, never lost) should be rated above fC (1 loss).
+    prob = features.elo_prob_feature(timeline, "fA", "fC", "2026-06-01")
+    assert prob > 0.5
+
+
+def test_matchup_feature_dict_omits_elo_when_timeline_not_provided(elo_history):
+    conn = elo_history
+    feat = features.matchup_feature_dict(conn, "fA", "fB", "2026-06-01")
+    assert feat["elo_prob_fighter_1"] is None
+
+
+def test_matchup_feature_dict_includes_elo_when_timeline_provided(elo_history):
+    conn = elo_history
+    timeline = features.build_elo_ratings(conn)
+    feat = features.matchup_feature_dict(conn, "fA", "fB", "2026-06-01", elo_timeline=timeline)
+    assert feat["elo_prob_fighter_1"] is not None
+    assert 0.0 < feat["elo_prob_fighter_1"] < 1.0
+
+
 def test_draws_and_no_contests_are_excluded_from_the_matrix(tmp_path):
     conn = _make_db(tmp_path)
     _insert_fighter(conn, "fA", "Fighter A")

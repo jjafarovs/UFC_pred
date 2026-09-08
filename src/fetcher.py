@@ -61,10 +61,21 @@ class UFCStatsClient:
         n = 0
         while not hashlib.sha256(f"{nonce}:{n}".encode()).hexdigest().startswith(target):
             n += 1
-        self.session.post(
-            f"{BASE_URL}/__c",
-            data=urlencode({"nonce": nonce, "n": n}),
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        # This POST previously had no timeout at all, unlike every GET in this
+        # file (all of which pass timeout=20 to _get_with_retries) -- a stall
+        # here meant the whole fetch (and the dashboard's Refresh button,
+        # which blocks on it) could hang indefinitely with no recovery. This
+        # happened in practice, not hypothetically: a real refresh sat stuck
+        # for 12+ minutes with near-zero CPU use (confirming it was blocked
+        # on network I/O, not the SHA-256 grind itself, which finishes in a
+        # fraction of a second).
+        _get_with_retries(
+            lambda: self.session.post(
+                f"{BASE_URL}/__c",
+                data=urlencode({"nonce": nonce, "n": n}),
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=20,
+            )
         )
         return True
 

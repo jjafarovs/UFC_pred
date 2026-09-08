@@ -107,6 +107,50 @@ def test_build_card_report_confidence_reflects_prior_fight_counts(tmp_path):
     assert result.iloc[0]["confidence"] == "low"
 
 
+def test_build_historical_card_report_uses_the_verified_closing_line_not_a_live_one(tmp_path):
+    conn = _db_with_history(tmp_path)
+    # fight1 (fA vs fC) already happened -- give it BOTH a close line (the
+    # real one) and a fight_id-less "live" row for fA, to prove the
+    # historical report reads the close line via fight_id, not whatever
+    # live/matchup-based lookup build_card_report would use.
+    conn.execute(
+        "INSERT INTO odds (fight_id, fighter_id, fighter_name_raw, sportsbook, odds_type, american_odds, decimal_odds, captured_at, source) "
+        "VALUES ('fight1', 'fA', 'Fighter A', 'BookOne', 'close', -200, ?, 'now', 'test')",
+        (cleaner._american_to_decimal(-200),),
+    )
+    conn.execute(
+        "INSERT INTO odds (fight_id, fighter_id, fighter_name_raw, sportsbook, odds_type, american_odds, decimal_odds, captured_at, source) "
+        "VALUES ('fight1', 'fC', 'Fighter C', 'BookOne', 'close', 170, ?, 'now', 'test')",
+        (cleaner._american_to_decimal(170),),
+    )
+    conn.commit()
+    fight1 = conn.execute("SELECT * FROM fights WHERE fight_id='fight1'").fetchone()
+
+    fake_model = _FakeModel(prob_fighter_1_win=0.65)
+    result = report.build_historical_card_report(conn, fake_model, [fight1])
+
+    assert len(result) == 1
+    row = result.iloc[0]
+    assert row["market_prob_fighter_1"] is not None
+    assert row["market_prob_fighter_1"] > 0.5  # fA (-200) is the favorite
+    assert row["result"] == "fighter_1"
+    assert row["winner_id"] == "fA"
+
+
+def test_build_historical_card_report_includes_result_for_correctness_checking(tmp_path):
+    conn = _db_with_history(tmp_path)
+    fight2 = conn.execute("SELECT * FROM fights WHERE fight_id='fight2'").fetchone()
+    fake_model = _FakeModel(prob_fighter_1_win=0.8)
+
+    result = report.build_historical_card_report(conn, fake_model, [fight2])
+
+    row = result.iloc[0]
+    assert row["fighter_1"] == "Fighter A"
+    assert row["fighter_2"] == "Fighter D"
+    assert row["result"] == "fighter_1"  # fA actually won
+    assert row["model_prob_fighter_1"] == pytest.approx(0.8)  # model correctly favored the actual winner
+
+
 def test_load_latest_model_picks_most_recently_timestamped_artifact(tmp_path):
     import joblib
 

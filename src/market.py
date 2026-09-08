@@ -97,6 +97,36 @@ def market_probabilities_for_matchup(
     return _devig_and_average(rows)
 
 
+def average_decimal_odds_for_matchup(
+    conn: sqlite3.Connection, fighter_id: str, odds_type: str = "live"
+) -> float | None:
+    """Raw (not de-vigged) average decimal odds for one fighter's side of an
+    upcoming matchup -- needed by strategy filters that gate on an actual
+    payout price (e.g. an odds ceiling), not a probability. `fight_id IS
+    NULL` is what an upcoming matchup's odds look like, same convention as
+    market_probabilities_for_matchup.
+    """
+    row = conn.execute(
+        "SELECT AVG(decimal_odds) FROM odds WHERE fight_id IS NULL AND fighter_id = ? AND odds_type = ?",
+        (fighter_id, odds_type),
+    ).fetchone()
+    return row[0]
+
+
+def average_decimal_odds_for_fight(
+    conn: sqlite3.Connection, fight_id: str, fighter_id: str, odds_type: str = "close"
+) -> float | None:
+    """Same as average_decimal_odds_for_matchup, but for a fight already
+    linked to a fight_id (a completed fight, or an upcoming one already
+    matched) -- same convention as market_probabilities_for_fight.
+    """
+    row = conn.execute(
+        "SELECT AVG(decimal_odds) FROM odds WHERE fight_id = ? AND fighter_id = ? AND odds_type = ?",
+        (fight_id, fighter_id, odds_type),
+    ).fetchone()
+    return row[0]
+
+
 def compute_edge(model_prob: float, market_prob: float) -> float:
     """model probability minus de-vigged market probability. Positive means
     the model thinks this fighter is more likely to win than the market
